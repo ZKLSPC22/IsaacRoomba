@@ -1,0 +1,36 @@
+env:
+  num_envs: 100
+  env_spacing: 5.0
+
+room:
+  # Preset
+  type: "standard"
+  
+  # Custom
+  width: 20.0
+  depth: 20.0
+
+  obstacles:
+    - type: "box"
+      x: 0.0
+      z: 0.0
+      width: 2.0
+      depth: 2.0
+    - type: "box"
+      x: 5.0
+      z: 5.0
+      width: 8.0
+      depth: 1.0
+
+sensors:
+  enable_bumper: true
+  enable_lidar: true
+  enable_camera: false
+  lidar_rays: 64
+  camera_res: 64
+
+robot:
+  urdf_path: "roomba.urdf"
+  radius: 0.17
+  max_linear_velocity: 0.6   # m/s
+  max_angular_velocity: 2.00  # rad/s
