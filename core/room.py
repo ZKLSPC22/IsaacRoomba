@@ -33,7 +33,7 @@ class BoxObstacle(Obstacle):
         pose.p = gymapi.Vec3(self.x, height / 2.0, self.z)
         
         actor_handle = gym.create_actor(
-            env_ptr, asset, pose, "box_obstacle", group=-1, filter=0
+            env_ptr, asset, pose, "box_obstaclconfige", group=-1, filter=0
         )
 
         return actor_handle
@@ -99,8 +99,8 @@ class Room:
         return cls(width=20.0, depth=20.0, obstacles=obstacles)
 
 
-class OccupencyMap:
-    def __init__(self, room: Room, config_path="config.yaml", resolution=0.05, robot_radius=0.17, safety_margin=0.05):
+class OccupancyMap:
+    def __init__(self, room: Room, config_path="configs/config.yaml", resolution=0.05, robot_radius=0.17, safety_margin=0.05):
         self.res = resolution
         self.width_cells = int(room.width / resolution)
         self.depth_cells = int(room.depth / resolution)
@@ -129,25 +129,7 @@ class OccupencyMap:
         y, x = np.ogrid[-radius_cells:radius_cells+1, -radius_cells:radius_cells+1]
         kernel = (x**2 + y**2 <= radius_cells**2).astype(np.uint8)
         
-        self.c_space_grid = binary_dilation(room:
-  # Preset
-  type: "standard"
-  
-  # Custom
-  width: 20.0
-  depth: 20.0
-
-  obstacles:
-    - type: "box"
-      x: 0.0
-      z: 0.0
-      width: 2.0
-      depth: 2.0
-    - type: "box"
-      x: 5.0
-      z: 5.0
-      width: 8.0
-      depth: 1.0self.grid, structure=kernel).astype(np.uint8)
+        self.c_space_grid = binary_dilation(self.grid, structure=kernel).astype(np.uint8)
         
         # Mark outer walls as occupied
         self.c_space_grid[:radius_cells, :] = 1

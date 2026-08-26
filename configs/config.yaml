@@ -1,5 +1,5 @@
 env:
-  num_envs: 100
+  num_envs: 1
   env_spacing: 5.0
 
 room:
@@ -23,9 +23,9 @@ room:
       depth: 1.0
 
 sensors:
-  enable_bumper: true
-  enable_lidar: true
-  enable_camera: false
+  enable_bumper: false
+  enable_lidar: false
+  enable_camera: true
   lidar_rays: 64
   camera_res: 64
 

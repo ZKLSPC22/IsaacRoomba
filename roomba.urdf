@@ -18,7 +18,7 @@
   <!-- BASE CHASSIS (The Disc)                                           -->
   <!-- ================================================================= -->
   <!-- 
-    Y is UP, X is FORWARD, Z is LEFT/RIGHT.
+    Y is UP, X is FORWARD, Z is RIGHT.
     A standard URDF cylinder aligns with Z. We rotate it 90 deg (1.5708 rad) 
     around X so the flat disc faces point UP and DOWN along the Y-axis. 
   -->
@@ -45,13 +45,38 @@
   </link>
 
   <!-- ================================================================= -->
+  <!-- FRONT DIRECTION MARKER                                            -->
+  <!-- ================================================================= -->
+  <material name="marker_color">
+    <color rgba="1.0 0.0 0.0 1.0"/> <!-- Bright Red -->
+  </material>
+
+  <link name="front_marker">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.04 0.04 0.04"/>
+      </geometry>
+      <material name="marker_color"/>
+    </visual>
+  </link>
+
+  <joint name="front_marker_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="front_marker"/>
+    <!-- Positioned near the front (+X) edge, sitting just on top (+Y) of the 0.08m chassis -->
+    <origin xyz="0.175 0.02 0" rpy="0 0 0"/>
+  </joint>
+
+
+  <!-- ================================================================= -->
   <!-- Camera/LiDAR sensor                                               -->
   <!-- ================================================================= -->
   <link name="lidar_link"/>
   <joint name="lidar_joint" type="fixed">
     <parent link="base_link"/>
     <child link="lidar_link"/>
-    <origin xyz="0 0.05 0" rpy="0 0 0"/> <!-- Sitting on top of the Roomba -->
+    <origin xyz="0 0.15 0" rpy="0 0 0"/> <!-- Sitting on top of the Roomba -->
   </joint>
 
   <!-- ================================================================= -->
@@ -85,8 +110,7 @@
   <joint name="left_wheel_joint" type="continuous">
     <parent link="base_link"/>
     <child link="left_wheel"/>
-    <!-- Positioned left (+Z = 0.1175m for 0.235m track baseline), Y = -0.024m to maintain ground touch -->
-    <origin xyz="0 -0.024 0.1175" rpy="0 0 0"/>
+    <origin xyz="0 -0.024 -0.1175" rpy="0 0 0"/>
     <!-- Rotates around the Z axis -->
     <axis xyz="0 0 1"/>
   </joint>
@@ -119,7 +143,7 @@
     <parent link="base_link"/>
     <child link="right_wheel"/>
     <!-- Positioned right (-Z = -0.1175m for 0.235m track baseline), Y = -0.024m to maintain ground touch -->
-    <origin xyz="0 -0.024 -0.1175" rpy="0 0 0"/>
+    <origin xyz="0 -0.024 0.1175" rpy="0 0 0"/>
     <axis xyz="0 0 1"/>
   </joint>
 

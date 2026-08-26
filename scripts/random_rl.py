@@ -1,14 +1,22 @@
+import sys
+from pathlib import Path
+
+# Add project root (IsaacRoomba) to sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+
 import time
-from env import RoombaEnv
+from envs.rl_env import RoombaRLEnv
 import torch
 
 
 def main():
     print("Initializing Roomba Environment...")
-    env = RoombaEnv(config_path="config.yaml", sim_device="cuda:0", show_viewer=True)
+    env = RoombaRLEnv(config_path="configs/config.yaml", sim_device="cuda:0", show_viewer=True)
     
     # Run an initial reset
     obs = env.reset()
+    env.render_debug_visuals(obs)  # Render the first frame manually
     print("Environment initialized and reset successfully.")
     
     num_envs = env.num_envs
@@ -23,7 +31,6 @@ def main():
     
     try:
         while True:
-# train.py
             if steps % 60 == 0:
                 actions[:, 0] = torch.rand(num_envs, device=device) * 0.7 + 0.3  # Forward bias: 0.3 to 1.0
                 actions[:, 1] = (torch.rand(num_envs, device=device) * 2.0) - 1.0  # Turn bias: -1.0 to 1.0
@@ -36,7 +43,7 @@ def main():
                 print("Viewer closed by user. Exiting...")
                 break
                 
-            obs, rewards, dones, info = result
+            obs, _, _, info = result
             steps += 1
             
             # Print FPS every 100 simulation steps
@@ -58,4 +65,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+    import torch
