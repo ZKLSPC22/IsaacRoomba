@@ -1,6 +1,6 @@
 import math
-
 import yaml
+
 from gym import spaces
 from isaacgym import gymapi, gymtorch
 
@@ -10,12 +10,12 @@ import torch
 
 
 class RoombaSimulator:
-    def __init__(self, config_path="configs/config.yaml", sim_device="cuda:0", show_viewer=True):
+    def __init__(self, num_envs, config_path="configs/config.yaml", sim_device="cuda:0", show_viewer=True):
         # 1. load config
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
-        self.num_envs = self.config['env']['num_envs']
+        self.num_envs = num_envs
         self.show_viewer = show_viewer
 
         if "cuda" in sim_device and torch.cuda.is_available():

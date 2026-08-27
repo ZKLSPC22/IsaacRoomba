@@ -1,0 +1,23 @@
+# configs/planners.yaml
+
+base:
+  max_rollout_depth: 20
+  c_param: 1.414
+  num_iterations: 100
+
+mcts:
+  # Action discretization for the fully observable trajectory optimizer
+  v_vals: [0.0, 0.5, 1.0]
+  omega_vals: [-1.0, -0.5, 0.0, 0.5, 1.0]
+
+pomcgs:
+  # Progressive Widening
+  k_a: 2.0
+  alpha_a: 0.5
+  k_o: 2.0
+  alpha_o: 0.5
+  
+  # Belief & Graph
+  num_particles: 10000
+  kmeans_clusters: 5
+  l1_merge_threshold: 0.1

@@ -1,31 +1,32 @@
 env:
-  num_envs: 1
+  num_rl_envs: 1
+  num_planning_envs: 64
   env_spacing: 5.0
 
 room:
   # Preset
-  type: "standard"
+  type: "custom"
   
   # Custom
-  width: 20.0
-  depth: 20.0
+  width: 5.0
+  depth: 5.0
 
   obstacles:
     - type: "box"
       x: 0.0
       z: 0.0
-      width: 2.0
-      depth: 2.0
-    - type: "box"
-      x: 5.0
-      z: 5.0
-      width: 8.0
+      width: 1.0
       depth: 1.0
+    - type: "box"
+      x: 1.5
+      z: 1.5
+      width: 2.0
+      depth: 0.5
 
 sensors:
   enable_bumper: false
   enable_lidar: false
-  enable_camera: true
+  enable_camera: false
   lidar_rays: 64
   camera_res: 64
 

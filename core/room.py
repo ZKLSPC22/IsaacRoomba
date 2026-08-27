@@ -47,7 +47,7 @@ class Room:
 
     obstacles: List[Obstacle]
 
-    def _build_walls(self, gym, sim, env_ptr, height: float = 2.0, thickness: float = 1.0):
+    def _build_walls(self, gym, sim, env_ptr, height: float = 2.0, thickness: float = 0.2):
         static_asset_option = gymapi.AssetOptions()
         static_asset_option.fix_base_link = True
 
