@@ -1,4 +1,10 @@
 import sys
+import os
+import csv
+import time
+import datetime
+import math
+
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -7,6 +13,12 @@ from envs.planning_env import RoombaPlanningEnv
 from planners.mcts import MCTSSolver, MCTSNode
 import torch
 
+
+def count_nodes(node):
+    """Recursively count the total number of nodes generated in the MCTS tree."""
+    if not node.children:
+        return 1
+    return 1 + sum(count_nodes(child) for child in node.children.values())
 
 def main():
     print("Initializing Planning Environment...")
@@ -34,34 +46,81 @@ def main():
     current_state[13] = goal_x
     current_state[14] = goal_z
 
+    # 4. Setup Logging Infrastructure
+    log_dir = Path("logs/mcts")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    log_file_path = log_dir / f"mcts_run_{timestamp}.csv"
+    
+    print(f"Logging initialized at: {log_file_path}")
     print("Starting execution loop...")
+
     steps = 0
     try:
-        while True:
-            start_time = time.time()
-            
-            # Wrap the exact state in a root node and search
-            root = MCTSNode(state=current_state.clone())
-            best_action_idx = mcts.search(root)
-            best_action = mcts.actions[best_action_idx]
-            
-            # Broadcast the chosen action and state to the batch to advance physics
-            action_batch = best_action.repeat(env.num_envs, 1)
-            state_batch = current_state.repeat(env.num_envs, 1)
-            
-            # Step the generative model to advance reality
-            next_states, _, _, dones = env.generate(state_batch, action_batch)
-            
-            # The true state becomes the state of the first environment
-            current_state = next_states[0].clone()
-            
-            steps += 1
-            elapsed = time.time() - start_time
-            print(f"Step: {steps:03d} | Action: v={best_action[0]:.2f}, w={best_action[1]:.2f} | Planning Time: {elapsed:.2f}s")
-            
-            if dones[0].item():
-                print("Goal Reached! Exiting...")
-                break
+        with open(log_file_path, mode="a", newline="") as log_file:
+            csv_writer = csv.writer(log_file)
+            csv_writer.writerow([
+                "Step",
+                "Action_V",
+                "Action_W",
+                "Root_Value",
+                "Tree_Size",
+                "Dist_To_Goal",
+                "Planning_Time_sec",
+            ])
+            log_file.flush()
+
+            while True:
+                start_time = time.time()
+                
+                # Wrap the exact state in a root node and search
+                root = MCTSNode(state=current_state.clone())
+                best_action_idx = mcts.search(root)
+                best_action = mcts.actions[best_action_idx]
+                
+                # Broadcast the chosen action and state to the batch to advance physics
+                action_batch = best_action.repeat(env.num_envs, 1)
+                state_batch = current_state.repeat(env.num_envs, 1)
+                
+                # Step the generative model to advance reality
+                next_states, _, _, dones = env.generate(state_batch, action_batch)
+                
+                # The true state becomes the state of the first environment
+                current_state = next_states[0].clone()
+                
+                steps += 1
+                elapsed = time.time() - start_time
+
+                # --- METRIC GATHERING ---
+                # Calculate expected value of the chosen root state
+                root_value = root.Q / root.N if root.N > 0 else 0.0
+                
+                # Calculate computational bloat (tree size)
+                tree_size = count_nodes(root)
+                
+                # Calculate physical progress (Euclidean distance to goal)
+                dx = current_state[13] - current_state[0]
+                dz = current_state[14] - current_state[2]
+                dist_to_goal = math.hypot(dx.item(), dz.item())
+                
+                # --- LOGGING ---
+                # Write to CSV and immediately flush to disk to protect against KeyboardInterrupt
+                csv_writer.writerow([
+                    steps, 
+                    round(best_action[0].item(), 2), 
+                    round(best_action[1].item(), 2), 
+                    round(root_value, 4), 
+                    tree_size, 
+                    round(dist_to_goal, 4), 
+                    round(elapsed, 4)
+                ])
+                log_file.flush()
+
+                print(f"Step: {steps:03d} | Action: v={best_action[0]:.2f}, w={best_action[1]:.2f} | Planning Time: {elapsed:.2f}s")
+                
+                if dones[0].item():
+                    print("Goal Reached! Exiting...")
+                    break
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")

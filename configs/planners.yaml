@@ -1,9 +1,11 @@
 # configs/planners.yaml
 
 base:
-  max_rollout_depth: 20
+  max_rollout_depth: 10
   c_param: 1.414
   num_iterations: 100
+  gamma: 0.95
+  pbrs_weight: 1.0
 
 mcts:
   # Action discretization for the fully observable trajectory optimizer

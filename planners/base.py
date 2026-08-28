@@ -34,6 +34,8 @@ class BaseSearcher:
         self.max_rollout_depth = base_cfg.get('max_rollout_depth', 15)
         self.c_param = base_cfg.get('c_param', 1.414)
         self.num_iterations = base_cfg.get('num_iterations', 100)
+        self.gamma = base_cfg.get('gamma', 0.99)
+        self.pbrs_weight = base_cfg.get('pbrs_weight', 1.0)
 
     def search(self, root_node, num_iterations=None):
         iters = num_iterations if num_iterations is not None else self.num_iterations
@@ -57,31 +59,50 @@ class BaseSearcher:
         best_action_idx = max(root_node.children.items(), key=lambda item: item[1].N)[0]
         return best_action_idx
 
-    # Parallel Rollout
+    # Parallel Rollout with telescoped PBRS reward
     def _batched_rollout(self, start_state_tensor: torch.Tensor, is_terminal: bool):
         if is_terminal:
             return 0.0
             
         current_states = start_state_tensor.repeat(self.num_envs, 1)
-        cumulative_rewards = torch.zeros(self.num_envs, device=self.device)
-        active_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         
+        # 1. Calculate Initial Potential Phi(s_0) for the expanded leaf
+        goals_x = self.env.goals[:, 0]
+        goals_z = self.env.goals[:, 1]
+        start_x = current_states[:, 0]
+        start_z = current_states[:, 2]
+        
+        dist_0 = torch.sqrt((goals_x - start_x)**2 + (goals_z - start_z)**2)
+        phi_0 = -self.pbrs_weight * dist_0
+        
+        cumulative_true_rewards = torch.zeros(self.num_envs, device=self.device)
+        active_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        current_gamma = 1.0
+        
+        # 2. Run the rollout to accumulate discounted true rewards
         for _ in range(self.max_rollout_depth):
             if not active_mask.any():
                 break
                 
             random_actions = self._sample_random_actions(self.num_envs)
-            
-            # Step the generative model G(s, a) -> (s', o, r, done)
             next_states, _, step_rewards, dones = self.env.generate(current_states, random_actions)
             
-            # Accumulate rewards only for envs that haven't hit the goal yet
-            cumulative_rewards[active_mask] += step_rewards[active_mask]
+            cumulative_true_rewards[active_mask] += current_gamma * step_rewards[active_mask]
             
             active_mask = active_mask & ~dones
             current_states = next_states
+            current_gamma *= self.gamma
             
-        return cumulative_rewards.mean().item()
+        # 3. Calculate Final Potential Phi(s_k) for the rollout leaves
+        end_x = current_states[:, 0]
+        end_z = current_states[:, 2]
+        dist_k = torch.sqrt((goals_x - end_x)**2 + (goals_z - end_z)**2)
+        phi_k = -self.pbrs_weight * dist_k
+        
+        # 4. PBRS Telescoping Sum: Sum(gamma^t * r_t) + gamma^k * Phi(s_k) - Phi(s_0)
+        rollout_returns = cumulative_true_rewards + (current_gamma * phi_k) - phi_0
+        
+        return rollout_returns.mean().item()
 
     def _backpropagate(self, node, value):
         """Walks up the parent pointers to update visit counts and values."""

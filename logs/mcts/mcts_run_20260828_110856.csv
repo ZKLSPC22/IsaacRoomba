@@ -1,0 +1,4 @@
+Step,Action_V,Action_W,Root_Value,Tree_Size,Dist_To_Goal,Planning_Time_sec
+1,0.0,-1.0,0.6886,241,3.7336,80.7202
+2,0.0,-1.0,0.6956,241,3.7336,80.4001
+3,0.0,-1.0,0.6956,241,3.7336,80.4311
