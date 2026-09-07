@@ -84,6 +84,7 @@ class RoombaSimulator:
     def _setup_simulator(self):
         """Initializes the PhysX physics engine with GPU pipeline enabled."""
         sim_params = gymapi.SimParams()
+        sim_params.dt = 1.0 / 30.0  # Force physics engine to 30 Hz
         sim_params.physx.use_gpu = True
         sim_params.use_gpu_pipeline = True
         sim_params.up_axis = gymapi.UP_AXIS_Y

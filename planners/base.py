@@ -35,6 +35,7 @@ class BaseSearcher:
         self.c_param = base_cfg.get('c_param', 1.414)
         self.num_iterations = base_cfg.get('num_iterations', 100)
         self.gamma = base_cfg.get('gamma', 0.99)
+        self.max_expansions = base_cfg.get('max_expansions', 15)
 
         # Number of node expansions (== generate() calls) in the last search.
         self.num_expansions = 0
@@ -49,7 +50,10 @@ class BaseSearcher:
         if not root_node.is_terminal:
             self._expand(root_node)
 
-        for _ in range(iters):
+        iteration = 0
+        while iteration < iters and self.num_expansions < self.max_expansions:
+            iteration += 1
+
             # 1. Selection
             node = self._select(root_node)
             
@@ -64,8 +68,18 @@ class BaseSearcher:
             # 4. Backpropagation (absorb leaf reward + gamma per Bellman equation)
             self._backpropagate(node, leaf_value)
 
-        # Return the action index with the highest visit count from the root
-        best_action_idx = max(root_node.children.items(), key=lambda item: item[1].N)[0]
+        # Select the executed action by mean value (Q/N) once every root child
+        # has been visited at least once, since transitions and leaf evaluation
+        # are deterministic here. Guard against unvisited children (N == 0) to
+        # avoid division by zero; fall back to highest visit count when the
+        # budget is too small to visit all root actions.
+        def safe_mean(node):
+            return node.Q / node.N if node.N > 0 else -float('inf')
+
+        if len(root_node.children) > 0 and all(child.N > 0 for child in root_node.children.values()):
+            best_action_idx = max(root_node.children.items(), key=lambda item: safe_mean(item[1]))[0]
+        else:
+            best_action_idx = max(root_node.children.items(), key=lambda item: item[1].N)[0]
         return best_action_idx
 
     def _backpropagate(self, node, value):

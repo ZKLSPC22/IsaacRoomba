@@ -3,6 +3,7 @@
 base:
   c_param: 1.414
   num_iterations: 100
+  max_expansions: 500
   gamma: 0.95
 
 mcts:
@@ -21,3 +22,4 @@ pomcgs:
   num_particles: 10000
   kmeans_clusters: 5
   l1_merge_threshold: 0.1
+  

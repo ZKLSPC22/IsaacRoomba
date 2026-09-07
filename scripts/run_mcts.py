@@ -12,6 +12,15 @@ import time
 from envs.planning_env import RoombaPlanningEnv
 from planners.mcts import MCTSSolver, MCTSNode
 import torch
+import numpy as np
+
+
+def seed_everything(seed: int):
+    """Seed NumPy and Torch for reproducible start/goal sampling and expansion order."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def count_nodes(node):
@@ -27,6 +36,12 @@ def tree_depth(node):
     return 1 + max(tree_depth(child) for child in node.children.values())
 
 def main():
+    # Seed NumPy and Torch from config before any sampling or search occurs.
+    import yaml
+    with open("configs/config.yaml", "r") as f:
+        _config = yaml.safe_load(f)
+    seed_everything(_config.get('env', {}).get('seed', 0))
+
     print("Initializing Planning Environment...")
     # NOTE: num_planning_envs (16) must be >= the discrete action grid size (15).
     env = RoombaPlanningEnv(config_path="configs/config.yaml", sim_device="cuda:0", show_viewer=False)
