@@ -124,7 +124,8 @@ class OccupancyMap:
 
         # 2. Inflate obstacles
         effective_radius = self.robot_radius + safety_margin
-        radius_cells = int(effective_radius / resolution)
+        # Round up so the represented clearance is never smaller than requested.
+        radius_cells = math.ceil(effective_radius / resolution)
         
         y, x = np.ogrid[-radius_cells:radius_cells+1, -radius_cells:radius_cells+1]
         kernel = (x**2 + y**2 <= radius_cells**2).astype(np.uint8)
@@ -145,8 +146,8 @@ class OccupancyMap:
         idx = np.random.randint(len(self.valid_cells))
         gx, gz = self.valid_cells[idx]
         
-        world_x = (gx * self.res) - (self.width_cells * self.res / 2.0)
-        world_z = (gz * self.res) - (self.depth_cells * self.res / 2.0)
+        world_x = ((gx + 0.5) * self.res) - (self.width_cells * self.res / 2.0)
+        world_z = ((gz + 0.5) * self.res) - (self.depth_cells * self.res / 2.0)
         return world_x, world_z
 
     def sample_valid_start_goal(self, min_dist: float = None, max_attempts: int = 1000):
@@ -155,7 +156,7 @@ class OccupancyMap:
         Independently sampling start and goal can produce degenerate episodes
         (goal already reached, identical poses, or trivially close targets), so
         we resample until the Euclidean distance between them meets the minimum.
-        Falls back to the last sampled pair if `max_attempts` is exhausted.
+        Raises ValueError if `max_attempts` is exhausted without success.
         """
         if min_dist is None:
             min_dist = self.min_start_goal_dist
@@ -168,5 +169,9 @@ class OccupancyMap:
                 return start_x, start_z, goal_x, goal_z
 
         # Exhausted attempts (room too small for the requested separation).
-        return start_x, start_z, goal_x, goal_z
+        raise ValueError(
+            f"Could not sample a start/goal pair at least {min_dist} m apart "
+            f"after {max_attempts} attempts. Check room dimensions and "
+            "min_start_goal_dist."
+        )
     

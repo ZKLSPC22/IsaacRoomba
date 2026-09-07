@@ -25,10 +25,13 @@ class RoombaSimulator:
             or self.config['sensors']['enable_lidar']
         )
 
-        if "cuda" in sim_device and torch.cuda.is_available():
-            self.device = sim_device
-        else:
-            self.device = "cpu"
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA is required: the Isaac Gym pipeline (use_gpu_pipeline=True) "
+                "does not support CPU. Install/configure a CUDA-capable GPU and "
+                "PyTorch CUDA build, then retry."
+            )
+        self.device = sim_device if "cuda" in sim_device else "cuda:0"
         self.device_id = torch.device(self.device).index or 0
 
         # Running count of PhysX physics ticks (incremented per step_physics call).
