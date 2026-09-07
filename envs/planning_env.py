@@ -125,7 +125,7 @@ class RoombaPlanningEnv:
 
         # 1. Estimate steps to goal (H)
         max_speed = self.config['robot']['max_linear_velocity']
-        step_duration = self.macro_action_ticks / 60.0
+        step_duration = self.macro_action_ticks * self.sim.dt
         max_dist_per_step = max_speed * step_duration
 
         # Distance remaining outside the 0.5m goal radius

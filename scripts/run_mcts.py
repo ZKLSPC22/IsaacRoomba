@@ -44,59 +44,59 @@ def main():
 
     print("Initializing Planning Environment...")
     # NOTE: num_planning_envs (16) must be >= the discrete action grid size (15).
-    env = RoombaPlanningEnv(config_path="configs/config.yaml", sim_device="cuda:0", show_viewer=False)
-    
-    print("Initializing Leaf-Parallel MCTS...")
-    # Requires configs/planners.yaml to exist
-    mcts = MCTSSolver(env, config_path="configs/planners.yaml")
-    
-    # 1. Acquire prior knowledge (Map and Goals)
-    prior_knowledge = env.get_prior_knowledge()
-    occupancy_map = prior_knowledge["occupancy_map"]
-    
-    # 2. Sample valid physical coordinates with a minimum start-goal separation
-    start_x, start_z, goal_x, goal_z = occupancy_map.sample_valid_start_goal()
-    
-    # 3. Construct the exact 15D state tensor
-    current_state = torch.zeros(15, dtype=torch.float32, device=env.device)
-    current_state[0] = start_x
-    current_state[1] = 0.065  # Spawn almost exactly at resting height
-    current_state[2] = start_z
-    current_state[6] = 1.0  # qw (neutral rotation)
-    current_state[13] = goal_x
-    current_state[14] = goal_z
-
-    # Teleport the robot to the start pose (spawned at resting height).
-    env.set_states(current_state.repeat(env.num_envs, 1))
-
-    # Derive the initial terminal flag from the distance to goal.
-    initial_dx = current_state[13] - current_state[0]
-    initial_dz = current_state[14] - current_state[2]
-    initial_dist = math.hypot(initial_dx.item(), initial_dz.item())
-    if initial_dist < 0.5:
-        print("Sampled start already satisfies the goal; skipping search.")
-        env.close()
-        return
-
-    # 4. Setup Logging Infrastructure
-    log_dir = Path("logs/mcts")
-    log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-    log_file_path = log_dir / f"mcts_run_{timestamp}.csv"
-    
-    print(f"Logging initialized at: {log_file_path}")
-    print("Starting execution loop...")
-
-    # Execution horizon + no-progress detection (config-driven).
-    env_cfg = env.config.get('env', {})
-    max_execution_steps = env_cfg.get('max_execution_steps', 200)
-    no_progress_steps = env_cfg.get('no_progress_steps', 50)
-    no_progress_threshold = env_cfg.get('no_progress_threshold', 0.05)
-
-    steps = 0
-    best_dist = float('inf')
-    steps_since_improvement = 0
+    env = None
     try:
+        env = RoombaPlanningEnv(config_path="configs/config.yaml", sim_device="cuda:0", show_viewer=False)
+
+        print("Initializing Leaf-Parallel MCTS...")
+        # Requires configs/planners.yaml to exist
+        mcts = MCTSSolver(env, config_path="configs/planners.yaml")
+
+        # 1. Acquire prior knowledge (Map and Goals)
+        prior_knowledge = env.get_prior_knowledge()
+        occupancy_map = prior_knowledge["occupancy_map"]
+
+        # 2. Sample valid physical coordinates with a minimum start-goal separation
+        start_x, start_z, goal_x, goal_z = occupancy_map.sample_valid_start_goal()
+
+        # 3. Construct the exact 15D state tensor
+        current_state = torch.zeros(15, dtype=torch.float32, device=env.device)
+        current_state[0] = start_x
+        current_state[1] = 0.065  # Spawn almost exactly at resting height
+        current_state[2] = start_z
+        current_state[6] = 1.0  # qw (neutral rotation)
+        current_state[13] = goal_x
+        current_state[14] = goal_z
+
+        # Teleport the robot to the start pose (spawned at resting height).
+        env.set_states(current_state.repeat(env.num_envs, 1))
+
+        # Derive the initial terminal flag from the distance to goal.
+        initial_dx = current_state[13] - current_state[0]
+        initial_dz = current_state[14] - current_state[2]
+        initial_dist = math.hypot(initial_dx.item(), initial_dz.item())
+        if initial_dist < 0.5:
+            print("Sampled start already satisfies the goal; skipping search.")
+            return
+
+        # 4. Setup Logging Infrastructure
+        log_dir = Path("logs/mcts")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        log_file_path = log_dir / f"mcts_run_{timestamp}.csv"
+
+        print(f"Logging initialized at: {log_file_path}")
+        print("Starting execution loop...")
+
+        # Execution horizon + no-progress detection (config-driven).
+        env_cfg = env.config.get('env', {})
+        max_execution_steps = env_cfg.get('max_execution_steps', 200)
+        no_progress_steps = env_cfg.get('no_progress_steps', 50)
+        no_progress_threshold = env_cfg.get('no_progress_threshold', 0.05)
+
+        steps = 0
+        best_dist = initial_dist
+        steps_since_improvement = 0
         with open(log_file_path, mode="a", newline="") as log_file:
             csv_writer = csv.writer(log_file)
             csv_writer.writerow([
@@ -193,7 +193,8 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
     finally:
-        env.close()
+        if env is not None:
+            env.close()
 
 if __name__ == "__main__":
     main()

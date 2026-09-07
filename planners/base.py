@@ -46,8 +46,12 @@ class BaseSearcher:
         # Reset the per-search expansion counter.
         self.num_expansions = 0
 
-        # Expand the root immediately to populate action children
-        if not root_node.is_terminal:
+        # A terminal root has no outgoing actions to evaluate.
+        if root_node.is_terminal:
+            return None
+
+        # Expand the root immediately (if the budget permits) to populate children.
+        if self.num_expansions < self.max_expansions:
             self._expand(root_node)
 
         iteration = 0
@@ -68,18 +72,18 @@ class BaseSearcher:
             # 4. Backpropagation (absorb leaf reward + gamma per Bellman equation)
             self._backpropagate(node, leaf_value)
 
-        # Select the executed action by mean value (Q/N) once every root child
-        # has been visited at least once, since transitions and leaf evaluation
-        # are deterministic here. Guard against unvisited children (N == 0) to
-        # avoid division by zero; fall back to highest visit count when the
-        # budget is too small to visit all root actions.
-        def safe_mean(node):
-            return node.Q / node.N if node.N > 0 else -float('inf')
+        # Select the executed action. Visited children are ranked by mean return
+        # (Q/N); unvisited children are ranked by their immediate one-step return
+        # estimate (reward + gamma * heuristic), so a tiny budget never arbitrarily
+        # favours action 0.
+        def value_of(child):
+            if child.N > 0:
+                return child.Q / child.N
+            return child.reward + (self.gamma * child.heuristic_value)
 
-        if len(root_node.children) > 0 and all(child.N > 0 for child in root_node.children.values()):
-            best_action_idx = max(root_node.children.items(), key=lambda item: safe_mean(item[1]))[0]
-        else:
-            best_action_idx = max(root_node.children.items(), key=lambda item: item[1].N)[0]
+        if not root_node.children:
+            return None
+        best_action_idx = max(root_node.children.items(), key=lambda item: value_of(item[1]))[0]
         return best_action_idx
 
     def _backpropagate(self, node, value):

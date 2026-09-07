@@ -41,6 +41,11 @@ class MCTSSolver(BaseSearcher):
             )
         if self.num_iterations < 1:
             raise ValueError("num_iterations must be >= 1 to produce root children.")
+        if self.max_expansions < self.num_actions:
+            raise ValueError(
+                f"max_expansions ({self.max_expansions}) must be at least num_actions "
+                f"({self.num_actions}) so every root action can be expanded."
+            )
         if not (0.0 <= self.gamma <= 1.0):
             raise ValueError(f"gamma must be in [0, 1]; got {self.gamma}.")
 
