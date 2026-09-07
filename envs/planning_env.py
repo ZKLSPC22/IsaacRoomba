@@ -15,6 +15,7 @@ class RoombaPlanningEnv:
             self.config = yaml.safe_load(f)
 
         self.num_envs = self.config['env']['num_planning_envs']
+        self.macro_action_ticks = self.config.get('planning', {}).get('macro_action_ticks', 30)
 
         # 1. Instantiate the physics core
         self.sim = RoombaSimulator(self.num_envs, config_path, sim_device, show_viewer)
@@ -65,6 +66,10 @@ class RoombaPlanningEnv:
     def get_states(self):
         """Packs the internal simulator root states and goals into an explicit state tensor."""
         root_states = self.sim.root_states[self.sim.robot_actor_indices].clone()
+        # Convert simulation-frame positions back to room-local coordinates.
+        root_states[:, 0] -= self.sim.env_origins[:, 0]
+        root_states[:, 1] -= self.sim.env_origins[:, 1]
+        root_states[:, 2] -= self.sim.env_origins[:, 2]
         return torch.cat([root_states, self.goals], dim=-1)
 
     def set_states(self, states: torch.Tensor):
@@ -72,45 +77,87 @@ class RoombaPlanningEnv:
         actor_ids = self.sim.robot_actor_indices
         
         # Extract root states and goals
-        root_states = states[:, :13]
+        root_states = states[:, :13].clone()
         self.goals = states[:, 13:15]
+        
+        # Convert room-local positions to simulation-frame coordinates by adding
+        # each environment's origin offset.
+        root_states[:, 0] += self.sim.env_origins[:, 0]
+        root_states[:, 1] += self.sim.env_origins[:, 1]
+        root_states[:, 2] += self.sim.env_origins[:, 2]
         
         # Write root states to simulator tensor
         self.sim.root_states[actor_ids] = root_states
         
         # Force the physics engine to teleport the actors
         self.sim.set_actor_root_states(self.sim.root_states, actor_ids)
+
+        # Reset wheel DOF state so G(s, a) is Markov in the 15D state
+        self.sim.reset_dof_states()
         
         # Step graphics so visual sensors (camera/lidar) update to the teleported positions
-        self.sim.gym.step_graphics(self.sim.sim)
+        self.sim.sync_graphics()
 
-    def _compute_rewards(self, obs, actions, dist_to_goal):
-        # Reward only at goal state
-        reached = dist_to_goal < 0.5
-        
-        bumped = torch.zeros(self.num_envs, device=self.device)
-        if "bumper" in obs:
-            bumped = obs["bumper"].squeeze(-1) > 0.5
-            
+    def settle(self):
+        """Ground the robots and return their settled states."""
+        self.sim.settle()
+        return self.get_states()
+
+    def _compute_bumped(self):
+        """Refresh contact forces and return a per-env bump boolean mask.
+
+        Decoupled from the observation dict so rewards can be computed even when
+        observations are skipped.
+        """
+        self.sim.gym.refresh_net_contact_force_tensor(self.sim.sim)
+        forces = self.sim.contact_forces_view[:, self.sim.chassis_body_idx, :]
+        return torch.norm(forces, dim=-1) > 0.1
+
+    def _compute_rewards(self, dist_to_goal, bumped):
         # +10 for goal, -5 for bumping, -0.1 per step to encourage speed
+        reached = dist_to_goal < 0.5
         rewards = (reached.float() * 10.0) - (bumped.float() * 5.0) - 0.1
         return rewards
 
-    def _compute_observations(self):
-        """Builds dictionary observations dynamically using pure PyTorch tensors."""
-        self.sim.gym.refresh_net_contact_force_tensor(self.sim.sim)
-        self.sim.gym.refresh_actor_root_state_tensor(self.sim.sim)
+    def compute_heuristic_values(self, states: torch.Tensor, is_terminal: torch.Tensor, heuristic_weight: float) -> torch.Tensor:
+        """Batch leaf evaluation — single source of truth for tree search.
 
+        Terminal states contribute no residual value (their reward is captured by
+        the node's immediate reward at expansion). Non-terminal states are valued
+        by the negated, weighted Euclidean distance to their goal.
+
+        Args:
+            states: [N, 15] physical states.
+            is_terminal: [N] boolean flags.
+            heuristic_weight: scalar shaping weight.
+
+        Returns:
+            [N] heuristic values on the same device as `states`.
+        """
+        dx = states[:, 13] - states[:, 0]
+        dz = states[:, 14] - states[:, 2]
+        distance = torch.sqrt(dx * dx + dz * dz)
+        values = -heuristic_weight * distance
+        return torch.where(is_terminal, torch.zeros_like(values), values)
+
+    def _compute_observations(self, bumped=None):
+        """Builds dictionary observations dynamically using pure PyTorch tensors.
+
+        `bumped` may be precomputed by the caller to avoid a redundant contact
+        refresh when rewards were already computed for this step.
+        """
         obs = {}
         sens_cfg = self.config['sensors']
 
         # Sensors                
         if sens_cfg['enable_bumper']:
-            forces = self.sim.contact_forces_view[:, self.sim.chassis_body_idx, :]
-            obs["bumper"] = (torch.norm(forces, dim=-1) > 0.1).float().unsqueeze(-1)
+            if bumped is None:
+                bumped = self._compute_bumped()
+            obs["bumper"] = bumped.float().unsqueeze(-1)
 
         # Visual sensors
         if sens_cfg['enable_lidar'] or sens_cfg['enable_camera']:
+            self.sim.sync_graphics()
             self.sim.gym.render_all_camera_sensors(self.sim.sim)
             self.sim.gym.start_access_image_tensors(self.sim.sim)
 
@@ -150,10 +197,14 @@ class RoombaPlanningEnv:
 
         return obs
 
-    def generate(self, states: torch.Tensor, actions: torch.Tensor):
+    def generate(self, states: torch.Tensor, actions: torch.Tensor, compute_observation: bool = True):
         """
         The Core Generative Model Interface G(s, a).
         Teleports to 'states', applies 'actions', and yields the transition.
+
+        `compute_observation` controls whether the observation dict is built.
+        Fully-observable planners (MCTS) only need (state, reward, done) and pass
+        False to skip unused observation work; POMCGS passes True (the default).
         """
         # 1. Teleport the batch
         self.set_states(states)
@@ -166,26 +217,43 @@ class RoombaPlanningEnv:
         v = clamped_action[:, 0] * max_lin
         omega = clamped_action[:, 1] * max_ang
         
-        L, R = 0.235, 0.036
+        L, R = 0.235, 0.036 
         v_left = - (v - (omega * L) / 2.0) / R
         v_right = - (v + (omega * L) / 2.0) / R
         
         self.sim.apply_wheel_velocities(v_left, v_right)
         
-        # 3. Advance physics (0.5s macro-action at 60Hz)
-        for _ in range(30):
+        # 3. Advance physics for one macro-action (default 30 ticks = 0.5s at 60Hz).
+        for _ in range(self.macro_action_ticks):
             self.sim.step_physics()
 
-        # Determine terminal nodes for tree search using internal coordinates
-        robot_x = self.sim.root_states[self.sim.robot_actor_indices, 0]
-        robot_z = self.sim.root_states[self.sim.robot_actor_indices, 2]
+        # Refresh the actor root-state tensor so the reads below reflect the
+        # post-physics state, not the teleported input state.
+        self.sim.gym.refresh_actor_root_state_tensor(self.sim.sim)
+
+        # Determine terminal nodes for tree search using room-local coordinates.
+        # Subtract each environment's origin so positions match the room-local
+        # goals stored in self.goals.
+        robot_x = self.sim.root_states[self.sim.robot_actor_indices, 0] - self.sim.env_origins[:, 0]
+        robot_z = self.sim.root_states[self.sim.robot_actor_indices, 2] - self.sim.env_origins[:, 2]
         dist_to_goal = torch.sqrt((self.goals[:, 0] - robot_x)**2 + (self.goals[:, 1] - robot_z)**2)
         dones = (dist_to_goal < 0.5)
         
-        # 4. Gather next state, observation, and reward
+        # 4. Gather next state, reward, and (optionally) observation.
         next_states = self.get_states()
-        obs = self._compute_observations()
-        rewards = self._compute_rewards(obs, clamped_action, dist_to_goal)
+
+        # Reward's bump penalty depends on contact forces, independent of the
+        # observation dict, so it is preserved even when observations are skipped.
+        if self.config['sensors']['enable_bumper']:
+            bumped = self._compute_bumped()
+        else:
+            bumped = torch.zeros(self.num_envs, device=self.device)
+        rewards = self._compute_rewards(dist_to_goal, bumped)
+
+        if compute_observation:
+            obs = self._compute_observations(bumped)
+        else:
+            obs = {}
         
         # Optional: Graphics sync
         self.render_debug_visuals(obs)

@@ -2,8 +2,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List
 
+import math
+
 import numpy as np
-import yaml
 from isaacgym import gymapi
 from scipy.ndimage import binary_dilation
 
@@ -100,13 +101,12 @@ class Room:
 
 
 class OccupancyMap:
-    def __init__(self, room: Room, config_path="configs/config.yaml", resolution=0.05, robot_radius=0.17, safety_margin=0.05):
+    def __init__(self, room: Room, resolution, robot_radius, safety_margin, min_start_goal_dist):
         self.res = resolution
         self.width_cells = int(room.width / resolution)
         self.depth_cells = int(room.depth / resolution)
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
-        self.robot_radius = self.config['robot']['radius']
+        self.robot_radius = robot_radius
+        self.min_start_goal_dist = min_start_goal_dist
 
         # 0 = Free, 1 = Obstacle
         self.grid = np.zeros((self.width_cells, self.depth_cells), dtype=np.uint8)
@@ -123,7 +123,7 @@ class OccupancyMap:
                           max(0, center_z-half_depth):min(self.depth_cells, center_z+half_depth)] = 1
 
         # 2. Inflate obstacles
-        effective_radius = robot_radius + safety_margin
+        effective_radius = self.robot_radius + safety_margin
         radius_cells = int(effective_radius / resolution)
         
         y, x = np.ogrid[-radius_cells:radius_cells+1, -radius_cells:radius_cells+1]
@@ -148,4 +148,25 @@ class OccupancyMap:
         world_x = (gx * self.res) - (self.width_cells * self.res / 2.0)
         world_z = (gz * self.res) - (self.depth_cells * self.res / 2.0)
         return world_x, world_z
+
+    def sample_valid_start_goal(self, min_dist: float = None, max_attempts: int = 1000):
+        """Sample a (start, goal) pose pair separated by at least `min_dist`.
+
+        Independently sampling start and goal can produce degenerate episodes
+        (goal already reached, identical poses, or trivially close targets), so
+        we resample until the Euclidean distance between them meets the minimum.
+        Falls back to the last sampled pair if `max_attempts` is exhausted.
+        """
+        if min_dist is None:
+            min_dist = self.min_start_goal_dist
+
+        for _ in range(max_attempts):
+            start_x, start_z = self.sample_valid_pose()
+            goal_x, goal_z = self.sample_valid_pose()
+            dist = math.hypot(goal_x - start_x, goal_z - start_z)
+            if dist >= min_dist:
+                return start_x, start_z, goal_x, goal_z
+
+        # Exhausted attempts (room too small for the requested separation).
+        return start_x, start_z, goal_x, goal_z
     

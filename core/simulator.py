@@ -18,11 +18,21 @@ class RoombaSimulator:
         self.num_envs = num_envs
         self.show_viewer = show_viewer
 
+        # Graphics are only needed when a viewer or visual sensor is active.
+        self.needs_graphics = (
+            self.show_viewer
+            or self.config['sensors']['enable_camera']
+            or self.config['sensors']['enable_lidar']
+        )
+
         if "cuda" in sim_device and torch.cuda.is_available():
             self.device = sim_device
         else:
             self.device = "cpu"
         self.device_id = torch.device(self.device).index or 0
+
+        # Running count of PhysX physics ticks (incremented per step_physics call).
+        self.physics_tick_count = 0
 
         # 2. Initialize physics simulator
         self.gym = gymapi.acquire_gym()
@@ -37,7 +47,14 @@ class RoombaSimulator:
 
         # Initialize the Occupancy Map and calculate safe spacing
         from core.room import OccupancyMap
-        self.occupancy_map = OccupancyMap(self.room)
+        room_cfg = self.config['room']
+        self.occupancy_map = OccupancyMap(
+            self.room,
+            resolution=room_cfg['occupancy_resolution'],
+            robot_radius=self.config['robot']['radius'],
+            safety_margin=room_cfg['safety_margin'],
+            min_start_goal_dist=room_cfg['min_start_goal_dist'],
+        )
         self.config['env']['env_spacing'] = self._calculate_dynamic_spacing()
 
         # Add ground plane
@@ -61,6 +78,9 @@ class RoombaSimulator:
         self.gym.prepare_sim(self.sim)
         self._init_hardware_tensors()
 
+        # Ground the spawned robots so the simulator starts in a settled state.
+        self.settle()
+
     def _setup_simulator(self):
         """Initializes the PhysX physics engine with GPU pipeline enabled."""
         sim_params = gymapi.SimParams()
@@ -70,7 +90,8 @@ class RoombaSimulator:
         sim_params.gravity = gymapi.Vec3(0.0, -9.81, 0.0)
 
         # API: (GPU for Physics, GPU for Rendering, Physics Engine, Params)
-        sim = self.gym.create_sim(self.device_id, self.device_id, gymapi.SIM_PHYSX, sim_params)
+        graphics_device = self.device_id if self.needs_graphics else -1
+        sim = self.gym.create_sim(self.device_id, graphics_device, gymapi.SIM_PHYSX, sim_params)
         if sim is None:
             raise RuntimeError("Failed to create Isaac Gym simulation environment.")
         return sim
@@ -117,9 +138,7 @@ class RoombaSimulator:
             raise ValueError(f"Unknown room layout type: '{room_type}'")
 
     def _calculate_dynamic_spacing(self):
-            room_width = self.config['room'].get('width', 20.0)
-            room_depth = self.config['room'].get('depth', 20.0)
-            calculated_spacing = max(room_width, room_depth) + 2.0
+            calculated_spacing = max(self.room.width, self.room.depth) + 2.0
             if calculated_spacing > 50.0:
                 raise ValueError(f"Spacing {calculated_spacing}m exceeds safety limit.")
             return calculated_spacing
@@ -139,9 +158,18 @@ class RoombaSimulator:
         self.lidar_handles = []
         # To reset the robots properly, the simulation track global actor indices, not just local environment handles
         self.robot_actor_indices = []
+        # Each Isaac environment is placed at its own origin in the simulation
+        # frame; room-local coordinates must be offset by this origin to map to
+        # simulation-frame positions (and back).
+        env_origins_list = []
 
         for i in range(self.num_envs):
             env = self.gym.create_env(self.sim, lower, upper, self.envs_per_row)
+            
+            # Record the environment's simulation-frame origin for coordinate
+            # conversion between room-local and world frames.
+            origin = self.gym.get_env_origin(env)
+            env_origins_list.append([origin.x, origin.y, origin.z])
             
             # Build physical Room walls and obstacles
             self.room.build_in_isaac(self.gym, self.sim, env)
@@ -210,6 +238,9 @@ class RoombaSimulator:
         self.robot_actor_indices = torch.tensor(
             self.robot_actor_indices, dtype=torch.int32, device=self.device
         )
+        self.env_origins = torch.tensor(
+            env_origins_list, dtype=torch.float32, device=self.device
+        )
 
     def _setup_viewer(self):
             self.viewer = self.gym.create_viewer(self.sim, gymapi.CameraProperties())
@@ -241,6 +272,14 @@ class RoombaSimulator:
         # Acquire root state tensor (for (x,z) position resetting)
         _root_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
         self.root_states = gymtorch.wrap_tensor(_root_tensor)
+
+        # Acquire DOF state tensor (for deterministic wheel reset on teleport).
+        # Layout is [num_envs, dofs_per_actor, 2] where the last dim is
+        # [position, velocity].
+        _dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
+        self.dof_states = gymtorch.wrap_tensor(_dof_state_tensor).view(
+            self.num_envs, self.dofs_per_actor, 2
+        )
 
         # Cache the chassis rigid body index once so we don't query it every frame
         if self.config['sensors']['enable_bumper']:
@@ -276,7 +315,38 @@ class RoombaSimulator:
         """Advances the simulation by one tick."""
         self.gym.simulate(self.sim)
         self.gym.fetch_results(self.sim, True)
-        self.gym.step_graphics(self.sim)
+        self.physics_tick_count += 1
+
+    def sync_graphics(self):
+        """Only steps graphics if the viewer or visual sensors require it."""
+        if self.needs_graphics:
+            self.gym.step_graphics(self.sim)
+
+    def settle(self, env_ids=None, max_steps=120, velocity_threshold=0.05):
+        """Ground the robots and bring them to rest.
+
+        Applies zero wheel-velocity targets and steps physics (no graphics) until
+        the linear velocity of the requested envs falls below `velocity_threshold`
+        or `max_steps` is reached. Refreshes the root-state tensor at the end so
+        callers read settled poses.
+        """
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
+
+        # Neutralize wheel targets for the settling envs only; others keep theirs.
+        self.dof_velocity_targets_view[env_ids, :] = 0.0
+        self.gym.set_dof_velocity_target_tensor(
+            self.sim, gymtorch.unwrap_tensor(self.dof_velocity_targets)
+        )
+
+        for _ in range(max_steps):
+            self.step_physics()
+            self.gym.refresh_actor_root_state_tensor(self.sim)
+            lin_vel = self.root_states[self.robot_actor_indices[env_ids], 7:10]
+            if float(torch.max(torch.abs(lin_vel)).item()) < velocity_threshold:
+                break
+
+        self.gym.refresh_actor_root_state_tensor(self.sim)
 
     def close(self):
         if self.show_viewer and self.viewer is not None:
@@ -291,4 +361,25 @@ class RoombaSimulator:
             gymtorch.unwrap_tensor(root_states),
             gymtorch.unwrap_tensor(actor_ids_int32),
             len(actor_ids_int32)
+        )
+
+    def reset_dof_states(self, env_ids=None):
+        """Zero out wheel DOF positions and velocities for the given envs.
+
+        Wheel DOF state is not captured by the 15D explicit state, so it must be
+        reset deterministically whenever robots are teleported. Otherwise the
+        generative transition G(s, a) becomes non-Markov, depending on whatever
+        actions the simulator slot happened to run previously.
+        """
+        # Sync the local tensor with the physics engine's current state first, so
+        # a partial reset zeroes only the requested envs without overwriting the
+        # active envs with stale wheel data.
+        self.gym.refresh_dof_state_tensor(self.sim)
+
+        if env_ids is None:
+            self.dof_states[:, :, :] = 0.0
+        else:
+            self.dof_states[env_ids, :, :] = 0.0
+        self.gym.set_dof_state_tensor(
+            self.sim, gymtorch.unwrap_tensor(self.dof_states)
         )

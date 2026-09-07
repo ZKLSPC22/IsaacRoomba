@@ -80,8 +80,6 @@ class RoombaRLEnv:
 
     def _compute_observations(self):
         """Builds dictionary observations dynamically using pure PyTorch tensors."""
-        self.sim.gym.refresh_net_contact_force_tensor(self.sim.sim)
-
         # Refresh the root states so positions update
         self.sim.gym.refresh_actor_root_state_tensor(self.sim.sim)
 
@@ -90,11 +88,13 @@ class RoombaRLEnv:
 
         # Sensors                
         if sens_cfg['enable_bumper']:
+            self.sim.gym.refresh_net_contact_force_tensor(self.sim.sim)
             forces = self.sim.contact_forces_view[:, self.sim.chassis_body_idx, :]
             obs["bumper"] = (torch.norm(forces, dim=-1) > 0.1).float().unsqueeze(-1)
 
         # Visual sensors
         if sens_cfg['enable_lidar'] or sens_cfg['enable_camera']:
+            self.sim.sync_graphics()
             self.sim.gym.render_all_camera_sensors(self.sim.sim)
             self.sim.gym.start_access_image_tensors(self.sim.sim)
 
@@ -180,10 +180,12 @@ class RoombaRLEnv:
         goals_x = torch.tensor(goals_x, dtype=torch.float32, device=self.device)
         goals_z = torch.tensor(goals_z, dtype=torch.float32, device=self.device)
 
-        # Bulk assignment to GPU tensors
-        self.sim.root_states[actor_ids, 0] = starts_x
+        # Bulk assignment to GPU tensors. Start/goal coordinates are room-local,
+        # so convert starts to simulation-frame positions by adding each env's
+        # origin. Goals stay room-local (like RoombaPlanningEnv).
+        self.sim.root_states[actor_ids, 0] = starts_x + self.sim.env_origins[env_ids, 0]
         self.sim.root_states[actor_ids, 1] = 0.5  # Drop height
-        self.sim.root_states[actor_ids, 2] = starts_z
+        self.sim.root_states[actor_ids, 2] = starts_z + self.sim.env_origins[env_ids, 2]
         
         self.goals[env_ids, 0] = goals_x
         self.goals[env_ids, 1] = goals_z
@@ -203,7 +205,14 @@ class RoombaRLEnv:
         self.sim.root_states[actor_ids, 7:13] = 0.0
 
         self.sim.set_actor_root_states(self.sim.root_states, actor_ids)
-        self.sim.gym.step_graphics(self.sim.sim)
+
+        # Reset wheel DOF state so the transition is Markov in the explicit state
+        self.sim.reset_dof_states(env_ids)
+
+        # Ground the reset robots before returning observations
+        self.sim.settle(env_ids)
+
+        self.sim.sync_graphics()
 
         obs = self._compute_observations()
         return obs
@@ -229,8 +238,8 @@ class RoombaRLEnv:
         # Gather new state details
         obs = self._compute_observations()
 
-        robot_x = self.sim.root_states[self.sim.robot_actor_indices, 0]
-        robot_z = self.sim.root_states[self.sim.robot_actor_indices, 2]
+        robot_x = self.sim.root_states[self.sim.robot_actor_indices, 0] - self.sim.env_origins[:, 0]
+        robot_z = self.sim.root_states[self.sim.robot_actor_indices, 2] - self.sim.env_origins[:, 2]
         dist_to_goal = torch.sqrt((self.goals[:, 0] - robot_x)**2 + (self.goals[:, 1] - robot_z)**2)
 
         rewards = self._compute_rewards(obs, clamped_action, dist_to_goal)

@@ -1,7 +1,17 @@
 env:
   num_rl_envs: 1
-  num_planning_envs: 64
-  env_spacing: 5.0
+  num_planning_envs: 16
+  env_spacing: 2.0
+  # Execution-loop horizon for run_mcts.py: fail the episode after this many steps.
+  max_execution_steps: 200
+  # Fail early if the distance to goal improves by less than this (m) over the window.
+  no_progress_steps: 50
+  no_progress_threshold: 0.05
+
+planning:
+  # Number of physics ticks per generative-model macro-action (60 Hz).
+  # 30 = 0.5 s; benchmark 30/20/15/10 to trade displacement vs runtime.
+  macro_action_ticks: 30
 
 room:
   # Preset
@@ -10,6 +20,13 @@ room:
   # Custom
   width: 5.0
   depth: 5.0
+
+  # Minimum Euclidean separation (m) between sampled start and goal poses.
+  min_start_goal_dist: 2.0
+
+  # Occupancy-map parameters (single source of truth for collision-free sampling).
+  occupancy_resolution: 0.05
+  safety_margin: 0.05
 
   obstacles:
     - type: "box"
@@ -24,7 +41,7 @@ room:
       depth: 0.5
 
 sensors:
-  enable_bumper: false
+  enable_bumper: True
   enable_lidar: false
   enable_camera: false
   lidar_rays: 64

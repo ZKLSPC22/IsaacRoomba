@@ -1,8 +1,3 @@
-'''
-The LiDAR visualization code is completely bugged out, need thorough human revision.
-'''
-
-
 import math
 import torch
 import numpy as np

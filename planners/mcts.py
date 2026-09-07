@@ -4,8 +4,14 @@ from planners.base import BaseNode, BaseSearcher
 
 class MCTSNode(BaseNode):
     """Stores the exact 15D physical state for fully observable planning."""
-    def __init__(self, state: torch.Tensor, parent=None, action_taken=None, is_terminal=False):
-        super().__init__(parent, action_taken, is_terminal)
+    def __init__(self, state: torch.Tensor, parent=None, action_taken=None, reward = 0.0, is_terminal=False, heuristic_value=0.0):
+        super().__init__(
+            parent=parent,
+            action_taken=action_taken,
+            reward=reward,
+            is_terminal=is_terminal,
+            heuristic_value=heuristic_value
+        )
         self.state = state
 
 
@@ -22,6 +28,21 @@ class MCTSSolver(BaseSearcher):
         self.mcts_cfg = self.config.get('mcts', {})
         self.actions = self._create_action_grid()
         self.num_actions = len(self.actions)
+        self._validate_config()
+
+    def _validate_config(self):
+        """Validate configuration invariants before any search runs."""
+        if self.num_actions <= 0:
+            raise ValueError("MCTS action grid is empty; check v_vals/omega_vals in configs/planners.yaml.")
+        if self.num_actions > self.num_envs:
+            raise ValueError(
+                f"num_actions ({self.num_actions}) exceeds num_envs ({self.num_envs}). "
+                "Increase num_planning_envs in configs/config.yaml or reduce the action grid."
+            )
+        if self.num_iterations < 1:
+            raise ValueError("num_iterations must be >= 1 to produce root children.")
+        if not (0.0 <= self.gamma <= 1.0):
+            raise ValueError(f"gamma must be in [0, 1]; got {self.gamma}.")
 
     def _create_action_grid(self):
         """Constructs the discrete action grid driven strictly by YAML values."""
@@ -37,11 +58,6 @@ class MCTSSolver(BaseSearcher):
     def _extract_physical_state(self, node):
         """For fully observable MCTS, the node's state is the exact physical state."""
         return node.state
-
-    def _sample_random_actions(self, num_samples):
-        """Uniformly samples from the configured discrete action grid."""
-        random_indices = torch.randint(0, self.num_actions, (num_samples,), device=self.device)
-        return self.actions[random_indices]
 
     def _select(self, node):
         """Descends the tree using UCB1 until a leaf is hit."""
@@ -70,19 +86,38 @@ class MCTSSolver(BaseSearcher):
         actions_batch[:self.num_actions] = self.actions
         
         # 4. Advance all environments in parallel on the GPU: G(s, a) -> (s', o, r, dones)
-        next_states, _, _, dones = self.env.generate(states_batch, actions_batch)
+        # MCTS only needs state/reward/done, so skip unused observation work.
+        next_states, _, rewards, dones = self.env.generate(states_batch, actions_batch, compute_observation=False)
+        self.num_expansions += 1
         
         # 5. Extract only the valid successor states corresponding to the discrete actions
         #    ignoring the outputs from the dummy padding environments.
+        active_states = next_states[:self.num_actions]
+        active_rewards = rewards[:self.num_actions]
+        active_dones = dones[:self.num_actions]
+
+        # Batch leaf evaluation for all new children in a single GPU pass.
+        heuristic_values = self.env.compute_heuristic_values(
+            active_states, active_dones, self.heuristic_weight
+        )
+
+        # One GPU->CPU transfer per quantity instead of a separate .item() per child.
+        rewards_np = active_rewards.cpu().numpy()
+        dones_np = active_dones.cpu().numpy()
+        heuristic_np = heuristic_values.cpu().numpy()
+
         for a_idx in range(self.num_actions):
-            child_state = next_states[a_idx].clone()
-            is_done = dones[a_idx].item()
             node.children[a_idx] = MCTSNode(
-                state=child_state, 
-                parent=node, 
-                action_taken=a_idx, 
-                is_terminal=is_done
+                state=active_states[a_idx].clone(),
+                parent=node,
+                action_taken=a_idx,
+                reward=float(rewards_np[a_idx]),
+                is_terminal=bool(dones_np[a_idx]),
+                heuristic_value=float(heuristic_np[a_idx]),
             )
             
-        # Return the first newly created child to begin the rollout phase
-        return node.children[0]
+        # Return a random newly created child to begin the rollout phase, so no
+        # single action (e.g. index 0) is systematically favoured.
+        random_a_idx = torch.randint(0, self.num_actions, (1,), device=self.device).item()
+        return node.children[random_a_idx]
+    
