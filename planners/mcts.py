@@ -98,7 +98,7 @@ class MCTSSolver(BaseSearcher):
 
         # Batch leaf evaluation for all new children in a single GPU pass.
         heuristic_values = self.env.compute_heuristic_values(
-            active_states, active_dones, self.heuristic_weight
+            active_states, active_dones, self.gamma
         )
 
         # One GPU->CPU transfer per quantity instead of a separate .item() per child.

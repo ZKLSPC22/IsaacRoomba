@@ -35,7 +35,6 @@ class BaseSearcher:
         self.c_param = base_cfg.get('c_param', 1.414)
         self.num_iterations = base_cfg.get('num_iterations', 100)
         self.gamma = base_cfg.get('gamma', 0.99)
-        self.heuristic_weight = base_cfg.get('heuristic_weight', 1.0)
 
         # Number of node expansions (== generate() calls) in the last search.
         self.num_expansions = 0

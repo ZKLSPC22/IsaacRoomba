@@ -98,11 +98,6 @@ class RoombaPlanningEnv:
         # Step graphics so visual sensors (camera/lidar) update to the teleported positions
         self.sim.sync_graphics()
 
-    def settle(self):
-        """Ground the robots and return their settled states."""
-        self.sim.settle()
-        return self.get_states()
-
     def _compute_bumped(self):
         """Refresh contact forces and return a per-env bump boolean mask.
 
@@ -119,25 +114,39 @@ class RoombaPlanningEnv:
         rewards = (reached.float() * 10.0) - (bumped.float() * 5.0) - 0.1
         return rewards
 
-    def compute_heuristic_values(self, states: torch.Tensor, is_terminal: torch.Tensor, heuristic_weight: float) -> torch.Tensor:
-        """Batch leaf evaluation — single source of truth for tree search.
-
-        Terminal states contribute no residual value (their reward is captured by
-        the node's immediate reward at expansion). Non-terminal states are valued
-        by the negated, weighted Euclidean distance to their goal.
-
-        Args:
-            states: [N, 15] physical states.
-            is_terminal: [N] boolean flags.
-            heuristic_weight: scalar shaping weight.
-
-        Returns:
-            [N] heuristic values on the same device as `states`.
+    def compute_heuristic_values(self, states: torch.Tensor, is_terminal: torch.Tensor, gamma: float) -> torch.Tensor:
+        """
+        Calculates the expected discounted return of an optimal, straight-line 
+        trajectory to the goal, preventing stalling pathologies.
         """
         dx = states[:, 13] - states[:, 0]
         dz = states[:, 14] - states[:, 2]
         distance = torch.sqrt(dx * dx + dz * dz)
-        values = -heuristic_weight * distance
+
+        # 1. Estimate steps to goal (H)
+        max_speed = self.config['robot']['max_linear_velocity']
+        step_duration = self.macro_action_ticks / 60.0
+        max_dist_per_step = max_speed * step_duration
+
+        # Distance remaining outside the 0.5m goal radius
+        d_remain = torch.clamp(distance - 0.5, min=0.0)
+        H = d_remain / max_dist_per_step
+
+        # A non-terminal state needs at least one more step to reach the goal,
+        # so floor H at 1 to keep the exponent (H - 1) non-negative.
+        H = torch.clamp(H, min=1.0)
+
+        # 2. Compute discounted return
+        goal_reward = 10.0
+        step_cost = -0.1
+
+        # V(s) = gamma^(H-1) * goal_reward + step_cost * (1 - gamma^H) / (1 - gamma)
+        # Guard gamma == 1, where the geometric series has the limit H.
+        if abs(1.0 - gamma) < 1e-9:
+            values = goal_reward + H * step_cost
+        else:
+            values = (gamma ** (H - 1)) * goal_reward + step_cost * ((1.0 - gamma ** H) / (1.0 - gamma))
+
         return torch.where(is_terminal, torch.zeros_like(values), values)
 
     def _compute_observations(self, bumped=None):
@@ -224,8 +233,12 @@ class RoombaPlanningEnv:
         self.sim.apply_wheel_velocities(v_left, v_right)
         
         # 3. Advance physics for one macro-action (default 30 ticks = 0.5s at 60Hz).
-        for _ in range(self.macro_action_ticks):
+        bumped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for tick in range(self.macro_action_ticks):
             self.sim.step_physics()
+            # Sample bumper contacts every 5 ticks and on the final tick
+            if self.config['sensors']['enable_bumper'] and (tick % 5 == 0 or tick == self.macro_action_ticks - 1):
+                bumped |= self._compute_bumped()
 
         # Refresh the actor root-state tensor so the reads below reflect the
         # post-physics state, not the teleported input state.
@@ -242,12 +255,6 @@ class RoombaPlanningEnv:
         # 4. Gather next state, reward, and (optionally) observation.
         next_states = self.get_states()
 
-        # Reward's bump penalty depends on contact forces, independent of the
-        # observation dict, so it is preserved even when observations are skipped.
-        if self.config['sensors']['enable_bumper']:
-            bumped = self._compute_bumped()
-        else:
-            bumped = torch.zeros(self.num_envs, device=self.device)
         rewards = self._compute_rewards(dist_to_goal, bumped)
 
         if compute_observation:

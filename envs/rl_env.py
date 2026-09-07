@@ -184,7 +184,7 @@ class RoombaRLEnv:
         # so convert starts to simulation-frame positions by adding each env's
         # origin. Goals stay room-local (like RoombaPlanningEnv).
         self.sim.root_states[actor_ids, 0] = starts_x + self.sim.env_origins[env_ids, 0]
-        self.sim.root_states[actor_ids, 1] = 0.5  # Drop height
+        self.sim.root_states[actor_ids, 1] = 0.065  # Spawn almost exactly at resting height
         self.sim.root_states[actor_ids, 2] = starts_z + self.sim.env_origins[env_ids, 2]
         
         self.goals[env_ids, 0] = goals_x
@@ -208,9 +208,6 @@ class RoombaRLEnv:
 
         # Reset wheel DOF state so the transition is Markov in the explicit state
         self.sim.reset_dof_states(env_ids)
-
-        # Ground the reset robots before returning observations
-        self.sim.settle(env_ids)
 
         self.sim.sync_graphics()
 

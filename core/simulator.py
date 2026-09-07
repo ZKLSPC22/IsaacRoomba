@@ -78,9 +78,6 @@ class RoombaSimulator:
         self.gym.prepare_sim(self.sim)
         self._init_hardware_tensors()
 
-        # Ground the spawned robots so the simulator starts in a settled state.
-        self.settle()
-
     def _setup_simulator(self):
         """Initializes the PhysX physics engine with GPU pipeline enabled."""
         sim_params = gymapi.SimParams()
@@ -151,7 +148,7 @@ class RoombaSimulator:
         upper = gymapi.Vec3(spacing, spacing, spacing)
 
         robot_pose = gymapi.Transform()
-        robot_pose.p = gymapi.Vec3(0.0, 0.5, 0.0)  # Drop slightly from above
+        robot_pose.p = gymapi.Vec3(0.0, 0.065, 0.0)  # Spawn almost exactly at resting height
 
         # Initialize handle storage lists
         self.camera_handles = []
@@ -284,7 +281,7 @@ class RoombaSimulator:
         # Cache the chassis rigid body index once so we don't query it every frame
         if self.config['sensors']['enable_bumper']:
             self.chassis_body_idx = self.gym.find_actor_rigid_body_index(
-                self.envs[0], self.robot_handles[0], "base_link", gymapi.DOMAIN_ACTOR
+                self.envs[0], self.robot_handles[0], "base_link", gymapi.DOMAIN_ENV
             )
 
         # Pre-wrap camera/LiDAR tensors (Zero-copy GPU pipeline)
@@ -321,32 +318,6 @@ class RoombaSimulator:
         """Only steps graphics if the viewer or visual sensors require it."""
         if self.needs_graphics:
             self.gym.step_graphics(self.sim)
-
-    def settle(self, env_ids=None, max_steps=120, velocity_threshold=0.05):
-        """Ground the robots and bring them to rest.
-
-        Applies zero wheel-velocity targets and steps physics (no graphics) until
-        the linear velocity of the requested envs falls below `velocity_threshold`
-        or `max_steps` is reached. Refreshes the root-state tensor at the end so
-        callers read settled poses.
-        """
-        if env_ids is None:
-            env_ids = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
-
-        # Neutralize wheel targets for the settling envs only; others keep theirs.
-        self.dof_velocity_targets_view[env_ids, :] = 0.0
-        self.gym.set_dof_velocity_target_tensor(
-            self.sim, gymtorch.unwrap_tensor(self.dof_velocity_targets)
-        )
-
-        for _ in range(max_steps):
-            self.step_physics()
-            self.gym.refresh_actor_root_state_tensor(self.sim)
-            lin_vel = self.root_states[self.robot_actor_indices[env_ids], 7:10]
-            if float(torch.max(torch.abs(lin_vel)).item()) < velocity_threshold:
-                break
-
-        self.gym.refresh_actor_root_state_tensor(self.sim)
 
     def close(self):
         if self.show_viewer and self.viewer is not None:

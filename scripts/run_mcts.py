@@ -45,17 +45,16 @@ def main():
     # 3. Construct the exact 15D state tensor
     current_state = torch.zeros(15, dtype=torch.float32, device=env.device)
     current_state[0] = start_x
-    current_state[1] = 0.5  # Drop height (settled to ground below)
+    current_state[1] = 0.065  # Spawn almost exactly at resting height
     current_state[2] = start_z
     current_state[6] = 1.0  # qw (neutral rotation)
     current_state[13] = goal_x
     current_state[14] = goal_z
 
-    # Teleport to the start pose, then ground the robot before the first search.
+    # Teleport the robot to the start pose (spawned at resting height).
     env.set_states(current_state.repeat(env.num_envs, 1))
-    current_state = env.settle()[0].clone()
 
-    # Derive the initial terminal flag from the settled state's distance to goal.
+    # Derive the initial terminal flag from the distance to goal.
     initial_dx = current_state[13] - current_state[0]
     initial_dz = current_state[14] - current_state[2]
     initial_dist = math.hypot(initial_dx.item(), initial_dz.item())
