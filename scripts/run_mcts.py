@@ -4,11 +4,11 @@ import csv
 import time
 import datetime
 import math
+import yaml
 
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-import time
 from envs.planning_env import RoombaPlanningEnv
 from planners.mcts import MCTSSolver, MCTSNode
 import torch
@@ -37,10 +37,18 @@ def tree_depth(node):
 
 def main():
     # Seed NumPy and Torch from config before any sampling or search occurs.
-    import yaml
-    with open("configs/config.yaml", "r") as f:
-        _config = yaml.safe_load(f)
-    seed_everything(_config.get('env', {}).get('seed', 0))
+    with open("configs/experiments.yaml", "r") as f:
+        experiment_config = yaml.safe_load(f)
+
+    seed = experiment_config["seed"]
+    max_execution_steps = experiment_config["max_execution_steps"]
+
+    no_progress_config = experiment_config["no_progress"]
+    no_progress_steps = no_progress_config["no_progress_steps"]
+    no_progress_threshold = no_progress_config["no_progress_threshold"]
+
+    # Seed before start/goal sampling or randomized MCTS expansion occurs.
+    seed_everything(seed)
 
     print("Initializing Planning Environment...")
     # NOTE: num_planning_envs (16) must be >= the discrete action grid size (15).
@@ -87,12 +95,6 @@ def main():
 
         print(f"Logging initialized at: {log_file_path}")
         print("Starting execution loop...")
-
-        # Execution horizon + no-progress detection (config-driven).
-        env_cfg = env.config.get('env', {})
-        max_execution_steps = env_cfg.get('max_execution_steps', 200)
-        no_progress_steps = env_cfg.get('no_progress_steps', 50)
-        no_progress_threshold = env_cfg.get('no_progress_threshold', 0.05)
 
         steps = 0
         best_dist = initial_dist

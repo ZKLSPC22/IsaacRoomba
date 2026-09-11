@@ -2,13 +2,6 @@ env:
   num_rl_envs: 1
   num_planning_envs: 16
   env_spacing: 2.0
-  # Random seed for NumPy/Torch (start/goal sampling and expansion order).
-  seed: 0
-  # Execution-loop horizon for run_mcts.py: fail the episode after this many steps.
-  max_execution_steps: 200
-  # Fail early if the distance to goal improves by less than this (m) over the window.
-  no_progress_steps: 50
-  no_progress_threshold: 0.05
 
 planning:
   # Number of physics ticks per generative-model macro-action.
