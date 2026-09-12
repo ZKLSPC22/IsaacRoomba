@@ -6,6 +6,7 @@ from isaacgym import gymapi, gymtorch
 import torch
 
 from core.simulator import RoombaSimulator
+from envs.planning_math import compute_planning_rewards, compute_straight_line_heuristic
 
 
 class RoombaPlanningEnv:
@@ -23,6 +24,15 @@ class RoombaPlanningEnv:
         # Pull necessary configs and hardware mapping from the simulator
         self.config = self.sim.config
         self.device = self.sim.device
+
+        # Task objective constants. Read with direct indexing so a typo or a
+        # missing key fails fast at construction rather than silently falling
+        # back to an unrelated default.
+        task_cfg = self.config['task']
+        self.goal_radius = task_cfg['goal_radius']
+        self.goal_reward = task_cfg['goal_reward']
+        self.collision_penalty = task_cfg['collision_penalty']
+        self.step_cost = task_cfg['step_cost']
 
         # 2. Setup indices and internal variables
         self.all_env_ids = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
@@ -64,12 +74,8 @@ class RoombaPlanningEnv:
         self.observation_space = spaces.Dict(obs_dict)
 
     def get_states(self):
-        """Packs the internal simulator root states and goals into an explicit state tensor."""
+        """Packs the environment-local simulator root states and goals."""
         root_states = self.sim.root_states[self.sim.robot_actor_indices].clone()
-        # Convert simulation-frame positions back to room-local coordinates.
-        root_states[:, 0] -= self.sim.env_origins[:, 0]
-        root_states[:, 1] -= self.sim.env_origins[:, 1]
-        root_states[:, 2] -= self.sim.env_origins[:, 2]
         return torch.cat([root_states, self.goals], dim=-1)
 
     def set_states(self, states: torch.Tensor):
@@ -79,12 +85,6 @@ class RoombaPlanningEnv:
         # Extract root states and goals
         root_states = states[:, :13].clone()
         self.goals = states[:, 13:15]
-        
-        # Convert room-local positions to simulation-frame coordinates by adding
-        # each environment's origin offset.
-        root_states[:, 0] += self.sim.env_origins[:, 0]
-        root_states[:, 1] += self.sim.env_origins[:, 1]
-        root_states[:, 2] += self.sim.env_origins[:, 2]
         
         # Write root states to simulator tensor
         self.sim.root_states[actor_ids] = root_states
@@ -109,45 +109,37 @@ class RoombaPlanningEnv:
         return torch.norm(forces, dim=-1) > 0.1
 
     def _compute_rewards(self, dist_to_goal, bumped):
-        # +10 for goal, -5 for bumping, -0.1 per step to encourage speed
-        reached = dist_to_goal < 0.5
-        rewards = (reached.float() * 10.0) - (bumped.float() * 5.0) - 0.1
-        return rewards
+        """Batched planning reward; binds task config to `envs.planning_math`.
+
+        Objective: +`goal_reward` for reaching the goal, +`collision_penalty` for
+        bumping, always +`step_cost` per macro-action.
+        """
+        return compute_planning_rewards(
+            dist_to_goal,
+            bumped,
+            goal_radius=self.goal_radius,
+            goal_reward=self.goal_reward,
+            collision_penalty=self.collision_penalty,
+            step_cost=self.step_cost,
+        )
 
     def compute_heuristic_values(self, states: torch.Tensor, is_terminal: torch.Tensor, gamma: float) -> torch.Tensor:
+        """Leaf value estimate for MCTS; binds env config to `envs.planning_math`.
+
+        Estimates the expected discounted return of an optimal, straight-line
+        trajectory to the goal, preventing stalling pathologies. This is a value
+        estimate, not a reward, and it is not potential-based reward shaping.
         """
-        Calculates the expected discounted return of an optimal, straight-line 
-        trajectory to the goal, preventing stalling pathologies.
-        """
-        dx = states[:, 13] - states[:, 0]
-        dz = states[:, 14] - states[:, 2]
-        distance = torch.sqrt(dx * dx + dz * dz)
-
-        # 1. Estimate steps to goal (H)
-        max_speed = self.config['robot']['max_linear_velocity']
-        step_duration = self.macro_action_ticks * self.sim.dt
-        max_dist_per_step = max_speed * step_duration
-
-        # Distance remaining outside the 0.5m goal radius
-        d_remain = torch.clamp(distance - 0.5, min=0.0)
-        H = d_remain / max_dist_per_step
-
-        # A non-terminal state needs at least one more step to reach the goal,
-        # so floor H at 1 to keep the exponent (H - 1) non-negative.
-        H = torch.clamp(H, min=1.0)
-
-        # 2. Compute discounted return
-        goal_reward = 10.0
-        step_cost = -0.1
-
-        # V(s) = gamma^(H-1) * goal_reward + step_cost * (1 - gamma^H) / (1 - gamma)
-        # Guard gamma == 1, where the geometric series has the limit H.
-        if abs(1.0 - gamma) < 1e-9:
-            values = goal_reward + H * step_cost
-        else:
-            values = (gamma ** (H - 1)) * goal_reward + step_cost * ((1.0 - gamma ** H) / (1.0 - gamma))
-
-        return torch.where(is_terminal, torch.zeros_like(values), values)
+        return compute_straight_line_heuristic(
+            states,
+            is_terminal,
+            gamma,
+            max_linear_velocity=self.config['robot']['max_linear_velocity'],
+            macro_action_duration=self.macro_action_ticks * self.sim.dt,
+            goal_radius=self.goal_radius,
+            goal_reward=self.goal_reward,
+            step_cost=self.step_cost,
+        )
 
     def _compute_observations(self, bumped=None):
         """Builds dictionary observations dynamically using pure PyTorch tensors.
@@ -244,14 +236,13 @@ class RoombaPlanningEnv:
         # post-physics state, not the teleported input state.
         self.sim.gym.refresh_actor_root_state_tensor(self.sim.sim)
 
-        # Determine terminal nodes for tree search using room-local coordinates.
-        # Subtract each environment's origin so positions match the room-local
-        # goals stored in self.goals.
-        robot_x = self.sim.root_states[self.sim.robot_actor_indices, 0] - self.sim.env_origins[:, 0]
-        robot_z = self.sim.root_states[self.sim.robot_actor_indices, 2] - self.sim.env_origins[:, 2]
+        # Root positions and goals are both environment-local.
+        robot_x = self.sim.root_states[self.sim.robot_actor_indices, 0]
+        robot_z = self.sim.root_states[self.sim.robot_actor_indices, 2]
         dist_to_goal = torch.sqrt((self.goals[:, 0] - robot_x)**2 + (self.goals[:, 1] - robot_z)**2)
-        dones = (dist_to_goal < 0.5)
-        
+        dones = (dist_to_goal < self.goal_radius)
+
+        self.sim.gym.refresh_actor_root_state_tensor(self.sim.sim)
         # 4. Gather next state, reward, and (optionally) observation.
         next_states = self.get_states()
 

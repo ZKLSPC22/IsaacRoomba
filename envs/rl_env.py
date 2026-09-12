@@ -180,13 +180,11 @@ class RoombaRLEnv:
         goals_x = torch.tensor(goals_x, dtype=torch.float32, device=self.device)
         goals_z = torch.tensor(goals_z, dtype=torch.float32, device=self.device)
 
-        # Bulk assignment to GPU tensors. Start/goal coordinates are room-local,
-        # so convert starts to simulation-frame positions by adding each env's
-        # origin. Goals stay room-local (like RoombaPlanningEnv).
-        self.sim.root_states[actor_ids, 0] = starts_x + self.sim.env_origins[env_ids, 0]
-        self.sim.root_states[actor_ids, 1] = 0.065  # Spawn almost exactly at resting height
-        self.sim.root_states[actor_ids, 2] = starts_z + self.sim.env_origins[env_ids, 2]
-        
+        # Start poses are already environment-local.
+        self.sim.root_states[actor_ids, 0] = starts_x
+        self.sim.root_states[actor_ids, 1] = 0.065
+        self.sim.root_states[actor_ids, 2] = starts_z
+                
         self.goals[env_ids, 0] = goals_x
         self.goals[env_ids, 1] = goals_z
         
@@ -231,12 +229,13 @@ class RoombaRLEnv:
         
         self.sim.apply_wheel_velocities(v_left, v_right)
         self.sim.step_physics()
+        self.sim.sync_graphics()
 
         # Gather new state details
         obs = self._compute_observations()
 
-        robot_x = self.sim.root_states[self.sim.robot_actor_indices, 0] - self.sim.env_origins[:, 0]
-        robot_z = self.sim.root_states[self.sim.robot_actor_indices, 2] - self.sim.env_origins[:, 2]
+        robot_x = self.sim.root_states[self.sim.robot_actor_indices, 0]
+        robot_z = self.sim.root_states[self.sim.robot_actor_indices, 2]
         dist_to_goal = torch.sqrt((self.goals[:, 0] - robot_x)**2 + (self.goals[:, 1] - robot_z)**2)
 
         rewards = self._compute_rewards(obs, clamped_action, dist_to_goal)

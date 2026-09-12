@@ -1,8 +1,5 @@
 import sys
-import os
-import csv
 import time
-import datetime
 import math
 import yaml
 
@@ -11,6 +8,17 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from envs.planning_env import RoombaPlanningEnv
 from planners.mcts import MCTSSolver, MCTSNode
+from tracking.run_logger import (
+    MCTSRunLogger,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_INTERRUPTED,
+    TERMINATION_ERROR,
+    TERMINATION_EXECUTION_HORIZON,
+    TERMINATION_GOAL_REACHED,
+    TERMINATION_INTERRUPTED,
+    TERMINATION_NO_PROGRESS,
+)
 import torch
 import numpy as np
 
@@ -35,15 +43,25 @@ def tree_depth(node):
         return 0
     return 1 + max(tree_depth(child) for child in node.children.values())
 
+def _finalize_safely(run_logger, **kwargs):
+    """Finalize a run without masking the exception that triggered finalization."""
+    try:
+        run_logger.finalize(**kwargs)
+    except Exception as exc:
+        print(f"Warning: failed to finalize run log: {exc}")
+
+
 def main():
     # Seed NumPy and Torch from config before any sampling or search occurs.
     with open("configs/experiments.yaml", "r") as f:
         experiment_config = yaml.safe_load(f)
 
-    seed = experiment_config["seed"]
-    max_execution_steps = experiment_config["max_execution_steps"]
+    # Runner settings are grouped under the planner key they apply to.
+    mcts_experiment_cfg = experiment_config["mcts"]
+    seed = mcts_experiment_cfg["seed"]
+    max_execution_steps = mcts_experiment_cfg["max_execution_steps"]
 
-    no_progress_config = experiment_config["no_progress"]
+    no_progress_config = mcts_experiment_cfg["no_progress"]
     no_progress_steps = no_progress_config["no_progress_steps"]
     no_progress_threshold = no_progress_config["no_progress_threshold"]
 
@@ -52,9 +70,14 @@ def main():
 
     print("Initializing Planning Environment...")
     # NOTE: num_planning_envs (16) must be >= the discrete action grid size (15).
+    # Pre-initialised so the exception handlers can finalize safely even if the
+    # failure happens before the execution loop starts.
     env = None
+    run_logger = None
+    steps = 0
+    final_dist = None
     try:
-        env = RoombaPlanningEnv(config_path="configs/config.yaml", sim_device="cuda:0", show_viewer=False)
+        env = RoombaPlanningEnv(config_path="configs/config.yaml", sim_device="cuda:0", show_viewer=True)
 
         print("Initializing Leaf-Parallel MCTS...")
         # Requires configs/planners.yaml to exist
@@ -87,114 +110,146 @@ def main():
             print("Sampled start already satisfies the goal; skipping search.")
             return
 
-        # 4. Setup Logging Infrastructure
-        log_dir = Path("logs/mcts")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        log_file_path = log_dir / f"mcts_run_{timestamp}.csv"
+        # 4. Setup Run Logging
+        # Each run owns a directory holding the authoritative run.yaml and steps.csv
+        # records, plus a derived TensorBoard event directory when enabled.
+        logging_cfg = mcts_experiment_cfg["logging"]
+        run_logger = MCTSRunLogger(
+            output_dir=logging_cfg["output_dir"],
+            environment_config=env.config,
+            planner_config=mcts.config,
+            experiment_config=experiment_config,
+            scenario={
+                "seed": seed,
+                "start": {"x": start_x, "z": start_z},
+                "goal": {"x": goal_x, "z": goal_z},
+            },
+            initial_distance=initial_dist,
+            enable_tensorboard=bool(logging_cfg["tensorboard"]),
+        )
 
-        print(f"Logging initialized at: {log_file_path}")
+        print(f"Logging initialized at: {run_logger.run_dir}")
         print("Starting execution loop...")
 
-        steps = 0
         best_dist = initial_dist
         steps_since_improvement = 0
-        with open(log_file_path, mode="a", newline="") as log_file:
-            csv_writer = csv.writer(log_file)
-            csv_writer.writerow([
-                "Step",
-                "Action_V",
-                "Action_W",
-                "Root_Value",
-                "Tree_Size",
-                "Max_Depth",
-                "Dist_To_Goal",
-                "Search_Time_sec",
-                "Exec_Time_sec",
-                "Num_Expansions",
-                "PhysX_Ticks",
-                "Decisions_Per_Sec",
-            ])
-            log_file.flush()
+        total_start = time.perf_counter()
 
-            total_start = time.perf_counter()
-            while steps < max_execution_steps:
-                # --- SEARCH (time + physics ticks isolated) ---
-                root = MCTSNode(state=current_state.clone())
-                search_start = time.perf_counter()
-                ticks_before_search = env.sim.physics_tick_count
-                best_action_idx = mcts.search(root)
-                search_time = time.perf_counter() - search_start
-                search_ticks = env.sim.physics_tick_count - ticks_before_search
+        # Default outcome if the loop runs out its horizon without breaking.
+        termination_reason = TERMINATION_EXECUTION_HORIZON
 
-                best_action = mcts.actions[best_action_idx]
-                
-                # --- EXECUTE SELECTED ACTION (time + physics ticks isolated) ---
-                action_batch = best_action.repeat(env.num_envs, 1)
-                state_batch = current_state.repeat(env.num_envs, 1)
-                exec_start = time.perf_counter()
-                ticks_before_exec = env.sim.physics_tick_count
-                next_states, _, _, dones = env.generate(state_batch, action_batch, compute_observation=False)
-                exec_time = time.perf_counter() - exec_start
-                exec_ticks = env.sim.physics_tick_count - ticks_before_exec
-                
-                # The true state becomes the state of the first environment
-                current_state = next_states[0].clone()
-                
-                steps += 1
+        while steps < max_execution_steps:
+            # --- SEARCH (time + physics ticks isolated) ---
+            root = MCTSNode(state=current_state.clone())
+            search_start = time.perf_counter()
+            ticks_before_search = env.sim.physics_tick_count
+            best_action_idx = mcts.search(root)
+            search_time = time.perf_counter() - search_start
+            search_ticks = env.sim.physics_tick_count - ticks_before_search
 
-                # --- METRIC GATHERING ---
-                root_value = root.Q / root.N if root.N > 0 else 0.0
-                tree_size = count_nodes(root)
-                max_depth = tree_depth(root)
-                num_expansions = mcts.num_expansions
-                physx_ticks = search_ticks + exec_ticks
-                decisions_per_sec = steps / (time.perf_counter() - total_start)
-                
-                # Physical progress (Euclidean distance to goal)
-                dx = current_state[13] - current_state[0]
-                dz = current_state[14] - current_state[2]
-                dist_to_goal = math.hypot(dx.item(), dz.item())
-                
-                # --- LOGGING ---
-                # Write to CSV and immediately flush to disk to protect against KeyboardInterrupt
-                csv_writer.writerow([
-                    steps, 
-                    round(best_action[0].item(), 2), 
-                    round(best_action[1].item(), 2), 
-                    round(root_value, 4), 
-                    tree_size, 
-                    max_depth,
-                    round(dist_to_goal, 4), 
-                    round(search_time, 6), 
-                    round(exec_time, 6), 
-                    num_expansions, 
-                    physx_ticks,
-                    round(decisions_per_sec, 4),
-                ])
-                log_file.flush()
+            best_action = mcts.actions[best_action_idx]
 
-                print(f"Step: {steps:03d} | v={best_action[0]:.2f}, w={best_action[1]:.2f} | Search: {search_time:.3f}s, Exec: {exec_time:.3f}s")
-                
-                if dones[0].item():
-                    print("Goal Reached! Exiting...")
-                    break
+            # --- EXECUTE SELECTED ACTION (time + physics ticks isolated) ---
+            action_batch = best_action.repeat(env.num_envs, 1)
+            state_batch = current_state.repeat(env.num_envs, 1)
+            exec_start = time.perf_counter()
+            ticks_before_exec = env.sim.physics_tick_count
+            next_states, _, exec_rewards, dones = env.generate(state_batch, action_batch, compute_observation=False)
+            exec_time = time.perf_counter() - exec_start
+            exec_ticks = env.sim.physics_tick_count - ticks_before_exec
 
-                # No-progress detection: fail if the robot is not closing in on the goal.
-                if dist_to_goal < best_dist - no_progress_threshold:
-                    best_dist = dist_to_goal
-                    steps_since_improvement = 0
-                else:
-                    steps_since_improvement += 1
-                    if steps_since_improvement >= no_progress_steps:
-                        print("No progress toward goal; terminating episode.")
-                        break
+            # The true state becomes the state of the first environment
+            current_state = next_states[0].clone()
+
+            steps += 1
+
+            # --- METRIC GATHERING ---
+            root_value = root.Q / root.N if root.N > 0 else 0.0
+            tree_size = count_nodes(root)
+            max_depth = tree_depth(root)
+            num_expansions = mcts.num_expansions
+            physx_ticks = search_ticks + exec_ticks
+            decisions_per_sec = steps / (time.perf_counter() - total_start)
+
+            # Physical progress (Euclidean distance to goal)
+            dx = current_state[13] - current_state[0]
+            dz = current_state[14] - current_state[2]
+            dist_to_goal = math.hypot(dx.item(), dz.item())
+            final_dist = dist_to_goal
+
+            # --- LOGGING ---
+            # One metrics dictionary feeds both CSV and TensorBoard, so the two
+            # representations cannot drift. CSV is flushed per row to protect
+            # against KeyboardInterrupt.
+            run_logger.log_step({
+                "step": steps,
+                "action_v_normalized": round(best_action[0].item(), 2),
+                "action_w_normalized": round(best_action[1].item(), 2),
+                "root_value": round(root_value, 4),
+                "tree_size": tree_size,
+                "max_depth": max_depth,
+                "distance_to_goal_m": round(dist_to_goal, 4),
+                "executed_reward": round(float(exec_rewards[0].item()), 4),
+                "search_time_sec": round(search_time, 6),
+                "execution_time_sec": round(exec_time, 6),
+                "expansion_calls": num_expansions,
+                "physics_ticks": physx_ticks,
+                "decisions_per_sec": round(decisions_per_sec, 4),
+            })
+
+            print(f"Step: {steps:03d} | v={best_action[0]:.2f}, w={best_action[1]:.2f} | Search: {search_time:.3f}s, Exec: {exec_time:.3f}s")
+
+            if dones[0].item():
+                print("Goal Reached! Exiting...")
+                termination_reason = TERMINATION_GOAL_REACHED
+                break
+
+            # No-progress detection: fail if the robot is not closing in on the goal.
+            if dist_to_goal < best_dist - no_progress_threshold:
+                best_dist = dist_to_goal
+                steps_since_improvement = 0
             else:
-                print(f"Reached execution horizon ({max_execution_steps} steps); terminating episode.")
+                steps_since_improvement += 1
+                if steps_since_improvement >= no_progress_steps:
+                    print("No progress toward goal; terminating episode.")
+                    termination_reason = TERMINATION_NO_PROGRESS
+                    break
+        else:
+            print(f"Reached execution horizon ({max_execution_steps} steps); terminating episode.")
+
+        run_logger.finalize(
+            status=STATUS_COMPLETED,
+            termination_reason=termination_reason,
+            success=(termination_reason == TERMINATION_GOAL_REACHED),
+            steps=steps,
+            final_distance=final_dist,
+        )
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
+        if run_logger is not None:
+            # Success is indeterminate for an interrupted run, so it stays null.
+            _finalize_safely(
+                run_logger,
+                status=STATUS_INTERRUPTED,
+                termination_reason=TERMINATION_INTERRUPTED,
+                steps=steps,
+                final_distance=final_dist,
+            )
+    except Exception:
+        # Best-effort finalization, then let the original error propagate.
+        if run_logger is not None:
+            _finalize_safely(
+                run_logger,
+                status=STATUS_FAILED,
+                termination_reason=TERMINATION_ERROR,
+                steps=steps,
+                final_distance=final_dist,
+            )
+        raise
     finally:
+        if run_logger is not None:
+            run_logger.close()
         if env is not None:
             env.close()
 

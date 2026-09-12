@@ -1,39 +1,51 @@
 env:
   num_rl_envs: 1
   num_planning_envs: 16
-  env_spacing: 2.0
+  env_spacing: 2.0  # Buffer/clearance distance (metres) between adjacent room outer walls
 
 planning:
   # Number of physics ticks per generative-model macro-action.
   # At 30 Hz (dt=1/30), 15 ticks = 0.5 seconds duration.
   macro_action_ticks: 15
 
-room:
-  # Preset
-  type: "custom"
-  
-  # Custom
-  width: 5.0
-  depth: 5.0
+task:
+  # Task objective constants (single source of truth for the planning reward and
+  # the leaf-value heuristic). Distances are metres; rewards are in reward units.
+  goal_radius: 0.5      # distance at which the goal counts as reached
+  goal_reward: 10.0     # reward for reaching the goal
+  collision_penalty: -5.0  # reward contribution for a bumper contact
+  step_cost: -0.1       # reward contribution per macro-action
 
-  # Minimum Euclidean separation (m) between sampled start and goal poses.
-  min_start_goal_dist: 2.0
+room:
+  # Preset selector: "empty", "standard", or "custom".
+  type: "custom"
+
+  # Custom layout (ignored when a preset type is selected).
+  custom:
+    width: 5.0
+    depth: 5.0
+
+    obstacles:
+      - type: "box"
+        x: 0.0
+        z: 0.0
+        width: 1.0
+        depth: 1.0
+
+      - type: "box"
+        x: 1.5
+        z: 1.5
+        width: 2.0
+        depth: 0.5
 
   # Occupancy-map parameters (single source of truth for collision-free sampling).
-  occupancy_resolution: 0.05
-  safety_margin: 0.05
+  occupancy_map:
+    resolution: 0.05
+    safety_margin: 0.05
 
-  obstacles:
-    - type: "box"
-      x: 0.0
-      z: 0.0
-      width: 1.0
-      depth: 1.0
-    - type: "box"
-      x: 1.5
-      z: 1.5
-      width: 2.0
-      depth: 0.5
+  # Minimum Euclidean separation (m) between sampled start and goal poses.
+  start_goal_sampling:
+    min_distance: 2.0
 
 sensors:
   enable_bumper: True

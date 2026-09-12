@@ -125,4 +125,3 @@ class MCTSSolver(BaseSearcher):
         # single action (e.g. index 0) is systematically favoured.
         random_a_idx = torch.randint(0, self.num_actions, (1,), device=self.device).item()
         return node.children[random_a_idx]
-    

@@ -47,18 +47,19 @@ class RoombaSimulator:
         self.num_dofs = self.num_envs * self.dofs_per_actor
 
         self.room = self._load_room_layout()
+        self.env_pitch = self._calculate_env_pitch()
+
 
         # Initialize the Occupancy Map and calculate safe spacing
         from core.room import OccupancyMap
         room_cfg = self.config['room']
         self.occupancy_map = OccupancyMap(
             self.room,
-            resolution=room_cfg['occupancy_resolution'],
+            resolution=room_cfg['occupancy_map']['resolution'],
             robot_radius=self.config['robot']['radius'],
-            safety_margin=room_cfg['safety_margin'],
-            min_start_goal_dist=room_cfg['min_start_goal_dist'],
+            safety_margin=room_cfg['occupancy_map']['safety_margin'],
+            min_start_goal_dist=room_cfg['start_goal_sampling']['min_distance'],
         )
-        self.config['env']['env_spacing'] = self._calculate_dynamic_spacing()
 
         # Add ground plane
         plane_params = gymapi.PlaneParams()
@@ -112,9 +113,7 @@ class RoombaSimulator:
     def _load_room_layout(self) -> Room:
         """Load room layout using presets or falls back to custom obstacle list"""
         room_cfg = self.config['room']
-        room_type = room_cfg.get('type', 'custom') # Default to custom
-        width = room_cfg.get('width', 20.0)
-        depth = room_cfg.get('depth', 20.0)
+        room_type = room_cfg.get('type', 'custom')  # Default to custom
 
         # 1. Match Preset Class Methods
         if room_type == "empty":
@@ -123,10 +122,14 @@ class RoombaSimulator:
         elif room_type == "standard":
             return Room.standard()
 
-        # 2. Custom Layout: Parse raw obstacles from YAML
+        # 2. Custom Layout: Parse raw obstacles from the 'custom' section
         elif room_type == "custom":
+            custom_cfg = room_cfg.get('custom', {})
+            width = custom_cfg.get('width', 20.0)
+            depth = custom_cfg.get('depth', 20.0)
+
             obstacles = []
-            for obs_cfg in room_cfg.get('obstacles', []):
+            for obs_cfg in custom_cfg.get('obstacles', []):
                 if obs_cfg['type'] == "box":
                     obstacles.append(BoxObstacle(
                         x=obs_cfg['x'], 
@@ -139,21 +142,24 @@ class RoombaSimulator:
         else:
             raise ValueError(f"Unknown room layout type: '{room_type}'")
 
-    def _calculate_dynamic_spacing(self):
-            calculated_spacing = max(self.room.width, self.room.depth) + 2.0
-            if calculated_spacing > 50.0:
-                raise ValueError(f"Spacing {calculated_spacing}m exceeds safety limit.")
-            return calculated_spacing
+    def _calculate_env_pitch(self) -> float:
+        """Calculates the center-to-center grid pitch: max(room_dim) + env_spacing."""
+        buffer_spacing = float(self.config['env']['env_spacing'])
+        max_room_dim = max(self.room.width, self.room.depth)
+        calculated_pitch = max_room_dim + buffer_spacing
+        if calculated_pitch > 50.0:
+            raise ValueError(f"Calculated environment pitch {calculated_pitch}m exceeds safety limit.")
+        return calculated_pitch
     
     def _create_envs(self):
         self.envs_per_row = int(math.sqrt(self.num_envs))
-        spacing = self.config['env']['env_spacing']
-        
-        lower = gymapi.Vec3(-spacing, 0.0, -spacing)
-        upper = gymapi.Vec3(spacing, spacing, spacing)
+
+        half_pitch = self.env_pitch / 2.0        
+        lower = gymapi.Vec3(-half_pitch, 0.0, -half_pitch)
+        upper = gymapi.Vec3(half_pitch, self.env_pitch, half_pitch)
 
         robot_pose = gymapi.Transform()
-        robot_pose.p = gymapi.Vec3(0.0, 0.065, 0.0)  # Spawn almost exactly at resting height
+        robot_pose.p = gymapi.Vec3(0.0, 0.065, 0.0)
 
         # Initialize handle storage lists
         self.camera_handles = []
@@ -246,9 +252,8 @@ class RoombaSimulator:
 
     def _setup_viewer(self):
             self.viewer = self.gym.create_viewer(self.sim, gymapi.CameraProperties())
-            spacing = self.config['env']['env_spacing']
     
-            viewer_center_offset = (self.envs_per_row - 1) * spacing
+            viewer_center_offset = (self.envs_per_row - 1) * self.env_pitch / 2
     
             cam_pos = gymapi.Vec3(viewer_center_offset + 5.0, 5.0, viewer_center_offset + 5.0)
             cam_target = gymapi.Vec3(viewer_center_offset, 0.0, viewer_center_offset)
@@ -274,6 +279,8 @@ class RoombaSimulator:
         # Acquire root state tensor (for (x,z) position resetting)
         _root_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
         self.root_states = gymtorch.wrap_tensor(_root_tensor)
+        # Sync initial actor positions from physics into PyTorch tensor
+        self.gym.refresh_actor_root_state_tensor(self.sim)
 
         # Acquire DOF state tensor (for deterministic wheel reset on teleport).
         # Layout is [num_envs, dofs_per_actor, 2] where the last dim is

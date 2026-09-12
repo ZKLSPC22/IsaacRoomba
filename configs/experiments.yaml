@@ -3,7 +3,13 @@ mcts:
   seed: 0
   # Execution-loop horizon for run_mcts.py: fail the episode after this many steps.
   max_execution_steps: 200
-  
+
   no_progress:
     no_progress_steps: 50
     no_progress_threshold: 0.05
+
+  # Per-run logging. Each run writes <output_dir>/<run_id>/{run.yaml,steps.csv}
+  # and, when tensorboard is true, <output_dir>/<run_id>/tensorboard/.
+  logging:
+    output_dir: "logs/mcts"
+    tensorboard: true

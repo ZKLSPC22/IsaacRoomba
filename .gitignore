@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# Generated experiment output (CSV run logs, TensorBoard scalar logs).
+# Note: files already tracked in Git remain tracked; this only affects new files.
+/logs/
