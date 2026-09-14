@@ -2,14 +2,16 @@ mcts:
   # Random seed for NumPy/Torch (start/goal sampling and expansion order).
   seed: 0
   # Execution-loop horizon for run_mcts.py: fail the episode after this many steps.
-  max_execution_steps: 200
+  max_execution_steps: 300
 
   no_progress:
     no_progress_steps: 50
-    no_progress_threshold: 0.05
+    no_progress_threshold: 0.02
 
-  # Per-run logging. Each run writes <output_dir>/<run_id>/{run.yaml,steps.csv}
-  # and, when tensorboard is true, <output_dir>/<run_id>/tensorboard/.
+  # Per-run logging. Each run always writes <output_dir>/<run_id>/{run.yaml,steps.csv};
+  # it additionally writes <output_dir>/<run_id>/tensorboard/ when tensorboard is true
+  # and <output_dir>/<run_id>/frames/ when render_frames is true.
   logging:
     output_dir: "logs/mcts"
     tensorboard: true
+    render_frames: true # Generate 2D top-down PNG flipbook frames under <run_dir>/frames/

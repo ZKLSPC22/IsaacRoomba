@@ -1,7 +1,14 @@
 """Tests for `envs.planning_math`.
 
-These tests pin the *existing* reward and heuristic formulas. They import `torch`
-only, so they run on CPU without Isaac Gym.
+These tests pin the *existing* reward and heuristic formulas, plus the *planned*
+geodesic sampling contract for the leaf heuristic. They import `torch` (and
+`numpy` for an independent sampling reference), so they run on CPU without Isaac
+Gym.
+
+`GeodesicHeuristicTests` exercises the signature that `compute_straight_line_heuristic`
+will gain (`distance_field`, `room_width`, `room_depth`). Until that parameter set
+is implemented it fails with `TypeError`; that failure is the intended state of
+ROADMAP Task 2.1 and not a broken test.
 
 The heuristic under test is a **value estimate** used as an MCTS leaf value. It is
 not part of the environment reward and it is **not** potential-based reward
@@ -16,6 +23,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
 import torch
 import yaml
 
@@ -82,6 +90,78 @@ def expected_value(H, gamma=GAMMA):
     if abs(1.0 - gamma) < 1e-9:
         return GOAL_REWARD + H * STEP_COST
     return (gamma ** (H - 1)) * GOAL_REWARD + STEP_COST * ((1.0 - gamma ** H) / (1.0 - gamma))
+
+
+# --- Geodesic distance-field fixtures ---------------------------------------
+# These pin the *planned* sampling contract: `compute_straight_line_heuristic`
+# gains `distance_field`, `room_width`, and `room_depth` and samples the field
+# instead of measuring a straight-line distance.
+
+#: 50 x 50 cells over a 5.0 m x 5.0 m room, i.e. 0.1 m cells.
+GEODESIC_ROOM_SIZE = 5.0
+GEODESIC_CELLS = 50
+GEODESIC_RESOLUTION = GEODESIC_ROOM_SIZE / GEODESIC_CELLS
+
+#: Grid rows/cols overwritten with a large finite value, standing in for an
+#: inflated obstacle margin: `[gz, gx]` indices covering roughly x in
+#: [-1.5, -0.5] m and z in [0.5, 1.5] m. A real field uses `max_finite + 2.0`
+#: there, never `inf`.
+GEODESIC_OBSTACLE_ROWS = slice(30, 40)
+GEODESIC_OBSTACLE_COLS = slice(10, 20)
+
+
+def geodesic_field_np() -> np.ndarray:
+    """Synthetic `(depth_cells, width_cells)` distance field in metres.
+
+    The per-axis slopes differ (0.8 m per metre along X, 0.2 along Z), so a
+    transposed tensor or a swapped sampling axis changes the sampled numbers.
+    """
+    index = np.arange(GEODESIC_CELLS)
+    x = (index + 0.5) * GEODESIC_RESOLUTION - GEODESIC_ROOM_SIZE / 2.0
+    z = (index + 0.5) * GEODESIC_RESOLUTION - GEODESIC_ROOM_SIZE / 2.0
+
+    field = (0.8 * x)[np.newaxis, :] + (0.2 * z)[:, np.newaxis] + 3.0
+    field[GEODESIC_OBSTACLE_ROWS, GEODESIC_OBSTACLE_COLS] = float(field.max()) + 2.0
+    return field
+
+
+def geodesic_field_tensor() -> torch.Tensor:
+    """The same field as the `[1, 1, depth_cells, width_cells]` planner tensor."""
+    field = geodesic_field_np()
+    return torch.tensor(field, dtype=torch.float32).view(1, 1, *field.shape)
+
+
+def sample_geodesic_field(field: np.ndarray, x: float, z: float) -> float:
+    """Independent NumPy reference for the documented `grid_sample` convention.
+
+    `align_corners=True` maps normalized `-1`/`+1` onto grid indices `0` and
+    `size - 1`, and `padding_mode="border"` clamps anything outside the room, so
+    this bilinear lookup is the value the planner must reproduce.
+    """
+    height, width = field.shape  # (depth, width)
+    fx = ((x / (GEODESIC_ROOM_SIZE / 2.0)) + 1.0) * 0.5 * (width - 1)
+    fz = ((z / (GEODESIC_ROOM_SIZE / 2.0)) + 1.0) * 0.5 * (height - 1)
+    fx = min(max(fx, 0.0), width - 1)
+    fz = min(max(fz, 0.0), height - 1)
+
+    x0, z0 = math.floor(fx), math.floor(fz)
+    x1, z1 = min(x0 + 1, width - 1), min(z0 + 1, height - 1)
+    wx, wz = fx - x0, fz - z0
+
+    return float(
+        field[z0, x0] * (1.0 - wx) * (1.0 - wz)
+        + field[z0, x1] * wx * (1.0 - wz)
+        + field[z1, x0] * (1.0 - wx) * wz
+        + field[z1, x1] * wx * wz
+    )
+
+
+def expected_geodesic_value(sampled_distance: float, gamma=GAMMA) -> float:
+    """Heuristic value implied by one sampled geodesic distance."""
+    max_dist_per_step = MAX_LINEAR_VELOCITY * MACRO_ACTION_DURATION
+    d_remain = max(sampled_distance - GOAL_RADIUS, 0.0)
+    H = max(d_remain / max_dist_per_step, 1.0)
+    return expected_value(H, gamma)
 
 
 class ConfigContractTests(unittest.TestCase):
@@ -352,6 +432,78 @@ class HeuristicTests(unittest.TestCase):
         states = make_states([0.0], [0.0], [1.0], [0.0])
         values = heuristic(states, torch.tensor([False]), goal_reward=1.0, step_cost=0.0)
         self.assertLessEqual(values[0].item(), 1.0)
+
+
+class GeodesicHeuristicTests(unittest.TestCase):
+    """The leaf heuristic samples a precomputed 2D distance field.
+
+    `distance_field` is shaped `[1, 1, depth_cells, width_cells]`, matching the
+    room-local `[gx, gz]` occupancy grid transposed so that the height axis is Z.
+    """
+
+    def setUp(self):
+        self.field = geodesic_field_np()
+        self.field_tensor = geodesic_field_tensor()
+
+    def call_heuristic(self, states, is_terminal, **overrides):
+        kwargs = {
+            "distance_field": self.field_tensor,
+            "room_width": GEODESIC_ROOM_SIZE,
+            "room_depth": GEODESIC_ROOM_SIZE,
+        }
+        kwargs.update(overrides)
+        return heuristic(states, is_terminal, **kwargs)
+
+    def test_geodesic_heuristic_sampling(self):
+        # Room-local query poses: free space, the obstacle margin, and a
+        # duplicate pose that is terminal (so its value must be exactly 0).
+        # The free poses stay clear of the obstacle block's rows, otherwise the
+        # bilinear lookup would blend the ramp with the margin value.
+        queries = [
+            (0.0, 0.0),
+            (1.0, -1.0),
+            (-1.5, -1.75),
+            (0.0, 0.0),
+            (-1.0, 1.0),
+        ]
+        is_terminal = torch.tensor([False, False, False, True, False])
+        states = make_states(
+            [x for x, _ in queries],
+            [z for _, z in queries],
+            [GOAL_RADIUS] * len(queries),
+            [0.0] * len(queries),
+        )
+
+        values = self.call_heuristic(states, is_terminal)
+        self.assertEqual(values.shape, (len(queries),))
+
+        for i, (x, z) in enumerate(queries):
+            with self.subTest(pose=(x, z)):
+                # No NaN/inf anywhere, including inside the obstacle margin.
+                self.assertTrue(
+                    torch.isfinite(values[i]).item(),
+                    msg=f"value at ({x}, {z}) was {values[i].item()}",
+                )
+                if is_terminal[i].item():
+                    self.assertEqual(values[i].item(), 0.0)
+                    continue
+
+                sampled = sample_geodesic_field(self.field, x, z)
+                self.assertAlmostEqual(
+                    values[i].item(), expected_geodesic_value(sampled), places=4
+                )
+
+        # Monotone in the sampled distance: nearer in the field means a higher
+        # value. The samples are 1.48 m, 3.00 m, 3.59 m and 7.45 m, so a
+        # transposed or swapped sampling axis breaks this ordering.
+        self.assertGreater(values[2].item(), values[0].item())
+        self.assertGreater(values[0].item(), values[1].item())
+        self.assertGreater(values[1].item(), values[4].item())
+
+        # A pose outside the room is clamped to the border, not turned into NaN.
+        outside = make_states([10.0], [10.0], [GOAL_RADIUS], [0.0])
+        outside_values = self.call_heuristic(outside, torch.tensor([False]))
+        self.assertTrue(torch.isfinite(outside_values[0]).item())
 
 
 if __name__ == "__main__":

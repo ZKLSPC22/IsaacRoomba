@@ -1,6 +1,7 @@
 """Experiment tracking utilities.
 
-See `tracking.run_logger` for the per-run logging implementation.
+See `tracking.run_logger` for the per-run logging implementation and
+`tracking.spatial_plotter` for headless 2D frame rendering.
 """
 
 from tracking.run_logger import (
@@ -10,6 +11,7 @@ from tracking.run_logger import (
     TENSORBOARD_TAGS,
     TensorBoardUnavailableError,
 )
+from tracking.spatial_plotter import TrajectoryVisualizer
 
 __all__ = [
     "MCTSRunLogger",
@@ -17,4 +19,5 @@ __all__ = [
     "STEP_COLUMNS",
     "TENSORBOARD_TAGS",
     "TensorBoardUnavailableError",
+    "TrajectoryVisualizer",
 ]

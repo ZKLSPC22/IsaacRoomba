@@ -22,8 +22,11 @@ import subprocess
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, Callable, Dict, Optional
 
 import yaml
+
+from tracking.spatial_plotter import TrajectoryVisualizer
 
 # Version of the `run.yaml` document layout. Bump when fields change meaning.
 RUN_LOG_SCHEMA_VERSION = 1
@@ -33,9 +36,15 @@ STEPS_FILENAME = "steps.csv"
 TENSORBOARD_DIRNAME = "tensorboard"
 
 # Per-step metric columns, in order. Names carry explicit units so that a CSV is
-# interpretable without the code that produced it.
+# interpretable without the code that produced it. The planar robot pose follows
+# `step` so a row reads left-to-right position first; those three columns are the
+# deliberate exception to unit-bearing names (`robot_x`/`robot_z` in metres,
+# `robot_yaw` in radians, planar frame with X horizontal and Z vertical).
 STEP_COLUMNS = (
     "step",
+    "robot_x",
+    "robot_z",
+    "robot_yaw",
     "action_v_normalized",
     "action_w_normalized",
     "root_value",
@@ -53,6 +62,9 @@ STEP_COLUMNS = (
 # TensorBoard scalar tags keyed by step-metric column. The per-step metrics
 # dictionary is built once; the same values go to CSV and TensorBoard.
 TENSORBOARD_TAGS = {
+    "robot_x": "trajectory/robot_x",
+    "robot_z": "trajectory/robot_z",
+    "robot_yaw": "trajectory/robot_yaw",
     "distance_to_goal_m": "navigation/distance_to_goal_m",
     "executed_reward": "navigation/executed_reward",
     "root_value": "search/root_value",
@@ -195,6 +207,11 @@ class MCTSRunLogger:
         tensorboard_writer=None,
         repo_root=None,
         timestamp=None,
+        enable_visualizer=False,
+        room_bounds=None,
+        obstacles=None,
+        goal=None,
+        goal_radius=0.5,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -238,6 +255,19 @@ class MCTSRunLogger:
         # Initial metadata is on disk before the execution loop starts, so an
         # interrupted run is still identifiable.
         self._write_metadata()
+
+        # Frame rendering is strictly optional and additive: without both a room
+        # description and a goal it stays disabled, and `log_step` never lets a
+        # rendering failure affect the authoritative CSV/YAML output.
+        self.visualizer: Optional[TrajectoryVisualizer] = None
+        if enable_visualizer and room_bounds is not None and goal is not None:
+            self.visualizer = TrajectoryVisualizer(
+                output_dir=self.run_dir,
+                room_bounds=room_bounds,
+                obstacles=obstacles or [],
+                goal=goal,
+                goal_radius=goal_radius,
+            )
 
         # Build the TensorBoard writer before opening the CSV so that a failed
         # writer setup cannot leak an open file handle.
@@ -317,12 +347,24 @@ class MCTSRunLogger:
 
     # ------------------------------------------------------------------ steps
 
-    def log_step(self, metrics: Mapping):
+    def log_step(
+        self,
+        metrics: Mapping,
+        hud_metrics: Optional[Dict[str, Any]] = None,
+        overlay_fn: Optional[Callable] = None,
+    ):
         """Write one metrics row to CSV and (if enabled) the same values to TensorBoard.
 
         `metrics` must contain every column in `STEP_COLUMNS`; missing keys raise
         `KeyError` so a misconfigured runner fails fast rather than writing an
         incomplete row.
+
+        When a visualizer is attached, the same metrics also produce one PNG
+        frame under `<run_dir>/frames/`. CSV and TensorBoard are written first,
+        so frame rendering is a derived artifact: it can neither change nor
+        truncate the authoritative record. `hud_metrics` and `overlay_fn` are
+        forwarded to the renderer untouched and are ignored when no visualizer is
+        attached.
         """
         missing = [column for column in STEP_COLUMNS if column not in metrics]
         if missing:
@@ -336,6 +378,25 @@ class MCTSRunLogger:
             step = int(metrics["step"])
             for column, tag in TENSORBOARD_TAGS.items():
                 self._writer.add_scalar(tag, float(metrics[column]), step)
+
+        # Shielding: a plotting failure (missing matplotlib backend, an
+        # unexpected overlay callback, a full disk) must never abort a run whose
+        # data is already safely written.
+        if self.visualizer is not None:
+            try:
+                pose = (
+                    float(metrics["robot_x"]),
+                    float(metrics["robot_z"]),
+                    float(metrics["robot_yaw"]),
+                )
+                self.visualizer.render_step(
+                    step=int(metrics["step"]),
+                    robot_pose=pose,
+                    hud_metrics=hud_metrics,
+                    overlay_fn=overlay_fn,
+                )
+            except Exception as exc:
+                print(f"Warning: failed to render frame for step {metrics.get('step')}: {exc}")
 
     # ----------------------------------------------------------- finalisation
 

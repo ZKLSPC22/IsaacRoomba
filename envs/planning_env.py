@@ -8,6 +8,10 @@ import torch
 from core.simulator import RoombaSimulator
 from envs.planning_math import compute_planning_rewards, compute_straight_line_heuristic
 
+#: Two goals within this distance (m) reuse the same cached distance field. This
+#: is a numerical guard, not a task parameter, so it is not configurable.
+_GOAL_CACHE_TOLERANCE = 1e-4
+
 
 class RoombaPlanningEnv:
     # Batched Generative Environment, yielding (s', o, r) given (s, a).
@@ -33,10 +37,16 @@ class RoombaPlanningEnv:
         self.goal_reward = task_cfg['goal_reward']
         self.collision_penalty = task_cfg['collision_penalty']
         self.step_cost = task_cfg['step_cost']
+        self.bumped_threshold = task_cfg['bumped_threshold']
 
         # 2. Setup indices and internal variables
         self.all_env_ids = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
         self.goals = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+
+        # 3. Geodesic distance-field cache: the field depends only on the goal
+        # (the room layout is static), so it is recomputed when the goal moves.
+        self._cached_goal = None
+        self._cached_distance_field = None
 
         self._setup_spaces()
 
@@ -106,7 +116,7 @@ class RoombaPlanningEnv:
         """
         self.sim.gym.refresh_net_contact_force_tensor(self.sim.sim)
         forces = self.sim.contact_forces_view[:, self.sim.chassis_body_idx, :]
-        return torch.norm(forces, dim=-1) > 0.1
+        return torch.norm(forces, dim=-1) > self.bumped_threshold
 
     def _compute_rewards(self, dist_to_goal, bumped):
         """Batched planning reward; binds task config to `envs.planning_math`.
@@ -123,13 +133,63 @@ class RoombaPlanningEnv:
             step_cost=self.step_cost,
         )
 
+    def _get_or_update_distance_field(self, goal_x: float, goal_z: float) -> torch.Tensor:
+        """Return the geodesic distance field for a goal, recomputing on change.
+
+        `OccupancyMap.compute_distance_field` runs Dijkstra over the precomputed
+        8-connected graph on the CPU, which is far too expensive to repeat per
+        MCTS leaf. The field depends only on the goal (the room layout is
+        static), so it is computed once per distinct goal and cached as a
+        float32 tensor on `self.device`. Caching keeps the hot search path GPU
+        batched with no per-leaf Python work.
+
+        The field is transposed from the map's `(width_cells, depth_cells)`
+        layout to `[1, 1, depth_cells, width_cells]`, because the heuristic
+        samples it with `torch.nn.functional.grid_sample`, whose height axis must
+        be depth (Z) and width axis width (X).
+
+        Args:
+            goal_x: Room-local goal X in metres.
+            goal_z: Room-local goal Z in metres.
+
+        Returns:
+            A `[1, 1, depth_cells, width_cells]` float32 tensor in metres on
+            `self.device`.
+        """
+        if self._cached_distance_field is not None and self._cached_goal is not None:
+            cached_x, cached_z = self._cached_goal
+            if (
+                abs(cached_x - goal_x) <= _GOAL_CACHE_TOLERANCE
+                and abs(cached_z - goal_z) <= _GOAL_CACHE_TOLERANCE
+            ):
+                return self._cached_distance_field
+
+        # (width_cells, depth_cells) -> contiguous (depth_cells, width_cells).
+        transposed = self.sim.occupancy_map.compute_distance_field(goal_x, goal_z).T.copy()
+        field = torch.tensor(transposed, dtype=torch.float32, device=self.device)
+        field = field.unsqueeze(0).unsqueeze(0)
+
+        self._cached_distance_field = field
+        self._cached_goal = (goal_x, goal_z)
+        return field
+
     def compute_heuristic_values(self, states: torch.Tensor, is_terminal: torch.Tensor, gamma: float) -> torch.Tensor:
         """Leaf value estimate for MCTS; binds env config to `envs.planning_math`.
 
-        Estimates the expected discounted return of an optimal, straight-line
-        trajectory to the goal, preventing stalling pathologies. This is a value
-        estimate, not a reward, and it is not potential-based reward shaping.
+        Estimates the expected discounted return of an optimal, obstacle-aware
+        trajectory to the goal, preventing stalling pathologies. The remaining
+        distance is sampled from the cached 2D geodesic distance field for the
+        current goal, so the estimate accounts for walls instead of assuming a
+        clear line of sight. This is a value estimate, not a reward, and it is
+        not potential-based reward shaping.
         """
+        # The field depends only on the goal, so one field covers the batch.
+        # Goals are shared across the planning environments (they differ only in
+        # the state being expanded), and are room-local like the field.
+        goal_x = states[0, 13].item()
+        goal_z = states[0, 14].item()
+        distance_field = self._get_or_update_distance_field(goal_x, goal_z)
+
         return compute_straight_line_heuristic(
             states,
             is_terminal,
@@ -139,6 +199,9 @@ class RoombaPlanningEnv:
             goal_radius=self.goal_radius,
             goal_reward=self.goal_reward,
             step_cost=self.step_cost,
+            distance_field=distance_field,
+            room_width=self.sim.room.width,
+            room_depth=self.sim.room.depth,
         )
 
     def _compute_observations(self, bumped=None):
@@ -224,7 +287,8 @@ class RoombaPlanningEnv:
         
         self.sim.apply_wheel_velocities(v_left, v_right)
         
-        # 3. Advance physics for one macro-action (default 30 ticks = 0.5s at 60Hz).
+        # 3. Advance physics for one macro-action: `macro_action_ticks`
+        #    simulation steps at the 30 Hz physics rate.
         bumped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         for tick in range(self.macro_action_ticks):
             self.sim.step_physics()

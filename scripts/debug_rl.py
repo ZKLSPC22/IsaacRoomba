@@ -22,8 +22,8 @@ def main():
     num_envs = env.num_envs
     device = env.device
 
-    # --- Initial 1-second warmup / settling phase (60 steps) ---
-    print("Warming up simulation for 1 second (60 steps)...")
+    # --- Initial 2-second warmup / settling phase (60 steps at 30 Hz) ---
+    print("Warming up simulation for 2 seconds (60 steps at 30 Hz)...")
     idle_action = torch.zeros((num_envs, 2), dtype=torch.float32, device=device)
     for _ in range(60):
         obs, rewards, dones, info = env.step(idle_action)

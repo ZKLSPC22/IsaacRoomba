@@ -125,8 +125,10 @@ class RoombaSimulator:
         # 2. Custom Layout: Parse raw obstacles from the 'custom' section
         elif room_type == "custom":
             custom_cfg = room_cfg.get('custom', {})
-            width = custom_cfg.get('width', 20.0)
-            depth = custom_cfg.get('depth', 20.0)
+            # Direct indexing: a custom room missing its extent is a configuration
+            # error, so fail fast rather than silently defaulting to a 20x20 room.
+            width = custom_cfg['width']
+            depth = custom_cfg['depth']
 
             obstacles = []
             for obs_cfg in custom_cfg.get('obstacles', []):

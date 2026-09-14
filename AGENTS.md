@@ -26,6 +26,11 @@ existing).
 - Hot paths stay GPU-batched (no per-env Python loops); the CPU occupancy map is the only exception.
 - `G(s, a)` stays Markov: teleports reset wheel DOF state; robots spawn at resting height.
 - `num_actions <= num_planning_envs` (enforced in `MCTSSolver`).
+- `steps.csv` carries the planar pose (`robot_x`, `robot_z`, `robot_yaw`, immediately after `step`),
+  written by `scripts/run_mcts.py` from the logged state. `STEP_COLUMNS` has three consumers: changing it
+  means changing `tracking/run_logger.py`, `scripts/run_mcts.py`, and `tests/test_run_logger.py`
+  together. PNG frames are a derived artifact — never make one authoritative, and never let a render
+  failure change or truncate a logged record (ARCHITECTURE §6).
 
 ## Config
 
@@ -38,8 +43,13 @@ existing).
 ## Verification and writing
 
 - Prefer GPU-free checks; do not launch GPU experiments unless required, and never to validate docs
-  (if one is needed, `scripts/run_mcts.py` with the viewer off, stopped early). `tests/` is untracked
-  and red — never report a passing suite.
+  (if one is needed, `scripts/run_mcts.py` with the viewer off, stopped early). `tests/` is tracked and
+  CPU-only: `python -m unittest discover -s tests` is the pre-experiment gate, currently 96 tests
+  (`test_distance_field` 4, `test_mcts` 26, `test_planning_math` 31, `test_run_logger` 24,
+  `test_spatial_plotter` 11), and no test may need Isaac Gym, CUDA, or a GPU. Run it before claiming a
+  suite result; the CPU-only modules `tests/test_spatial_plotter.py` (visualizer + offline replay) and
+  `tests/test_run_logger.py` (log schema) are the ones that guard the logging path. A test that needs a
+  GPU does not belong here.
 - Prefer existing dependencies; never invent versions or install paths — Isaac Gym, CUDA, and PyTorch
   are unpinned external prerequisites.
 - Concise, implemented-vs-planned, relative links, no invented numbers. Architecture detail in

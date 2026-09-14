@@ -51,6 +51,9 @@ def _step_metrics(step=1):
     """A complete, valid per-step metrics dictionary."""
     return {
         "step": step,
+        "robot_x": -0.725,
+        "robot_z": -0.625,
+        "robot_yaw": 0.0,
         "action_v_normalized": 0.5,
         "action_w_normalized": -1.0,
         "root_value": -3.25,
@@ -237,6 +240,9 @@ class StepsCsvTests(RunLoggerTestBase):
         row = rows[0]
         self.assertEqual(set(row), set(STEP_COLUMNS))
         self.assertEqual(row["step"], "1")
+        self.assertEqual(row["robot_x"], "-0.725")
+        self.assertEqual(row["robot_z"], "-0.625")
+        self.assertEqual(row["robot_yaw"], "0.0")
         self.assertEqual(row["tree_size"], "241")
         self.assertEqual(row["distance_to_goal_m"], "2.7518")
         self.assertEqual(row["executed_reward"], "-0.1")
@@ -261,6 +267,42 @@ class StepsCsvTests(RunLoggerTestBase):
         rows = list(csv.DictReader(logger.steps_path.read_text().splitlines()))
         self.assertEqual([row["step"] for row in rows], ["1", "2", "3"])
         self.assertEqual([row["distance_to_goal_m"] for row in rows], ["2.0", "1.0", "0.0"])
+
+
+class PoseColumnTests(RunLoggerTestBase):
+    """`steps.csv` records the planar robot pose alongside `step`."""
+
+    def test_pose_columns_follow_step_in_schema(self):
+        self.assertEqual(STEP_COLUMNS[0], "step")
+        self.assertEqual(STEP_COLUMNS[1:4], ("robot_x", "robot_z", "robot_yaw"))
+        self.assertEqual(len(set(STEP_COLUMNS)), len(STEP_COLUMNS), "duplicate column")
+
+    def test_missing_pose_columns_raise_keyerror(self):
+        for column in ("robot_x", "robot_z", "robot_yaw"):
+            with self.subTest(column=column):
+                logger = self.make_logger()
+                metrics = _step_metrics()
+                del metrics[column]
+
+                with self.assertRaises(KeyError):
+                    logger.log_step(metrics)
+
+    def test_run_logger_initializes_visualizer_when_enabled(self):
+        logger = self.make_logger(
+            enable_visualizer=True,
+            room_bounds=(10.0, 10.0),
+            obstacles=[],
+            goal=(2.0, 2.0),
+        )
+        logger.log_step(_step_metrics(step=1))
+
+        self.assertIsNotNone(logger.visualizer)
+        self.assertTrue((logger.run_dir / "frames" / "step_001.png").exists())
+
+    def test_visualizer_is_absent_by_default(self):
+        logger = self.make_logger()
+        self.assertIsNone(logger.visualizer)
+        self.assertFalse((logger.run_dir / "frames").exists())
 
 
 class FinalizeTests(RunLoggerTestBase):

@@ -3,14 +3,30 @@
 base:
   # UCB1 Parameter, using the standard value 1.414 (roughly root 2) 
   c_param: 1.414
-  num_iterations: 100
-  max_expansions: 300
+  num_iterations: 300
   gamma: 0.95
 
 mcts:
-  # Action discretization for the fully observable trajectory optimizer
-  v_vals: [0.0, 0.5, 1.0]
-  omega_vals: [-1.0, -0.5, 0.0, 0.5, 1.0]
+  # Explicit action set for the fully observable trajectory optimizer, given as
+  # [linear_velocity, angular_velocity] normalized to [-1, 1].
+  #
+  # Order is load-bearing: the list index is the action's identity. It is stored
+  # in `node.action_taken`, written to the run log, and used as the tie-break key
+  # in `BaseSearcher.search()`, which keeps the first maximum encountered so
+  # lower indices win exact ties.
+  #
+  # The stationary [0.0, 0.0] action is deliberately absent: it would let the
+  # robot park indefinitely, which is what the no-progress detector in
+  # `scripts/run_mcts.py` exists to catch.
+  #
+  # Which omega sign is physically counterclockwise is not yet confirmed
+  # empirically; see `CCW_SIGN` in tests/test_mcts.py.
+  actions:
+    - [1.0, 0.0] # forward, straight
+    - [1.0, 1.0] # forward while turning, omega > 0
+    - [1.0, -1.0] # forward while turning, omega < 0
+    - [0.0, 1.0] # rotate in place, omega > 0
+    - [0.0, -1.0] # rotate in place, omega < 0
 
 pomcgs:
   # Progressive Widening

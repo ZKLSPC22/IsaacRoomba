@@ -22,6 +22,12 @@ class RoombaRLEnv:
         self.config = self.sim.config
         self.device = self.sim.device
 
+        task_cfg = self.config['task']
+        self.goal_radius = task_cfg['goal_radius']
+        self.goal_reward = task_cfg['goal_reward']
+        self.collision_penalty = task_cfg['collision_penalty']
+        self.step_cost = task_cfg['step_cost']
+
         # 2. Setup RL-specific variables
         self.all_env_ids = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
         self.goals = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
@@ -60,7 +66,7 @@ class RoombaRLEnv:
         self.observation_space = spaces.Dict(obs_dict)
 
     def _compute_rewards(self, obs, actions, dist_to_goal):
-        reached = dist_to_goal < 0.5
+        reached = dist_to_goal < self.goal_radius
         
         bumped = torch.zeros(self.num_envs, device=self.device)
         if "bumper" in obs:
@@ -70,12 +76,13 @@ class RoombaRLEnv:
         progress = torch.clamp(self.min_dist_to_goal - dist_to_goal, min=0.0)
         self.min_dist_to_goal = torch.minimum(self.min_dist_to_goal, dist_to_goal)
         
-        rewards = (progress * 5.0) + (reached.float() * 10.0) - (bumped.float() * 5.0)
+        rewards = (progress * self.config['rl']['progress_weight']) + (reached.float() * 10.0) + (bumped.float() * self.collision_penalty)
         return rewards
 
     def _compute_dones(self, dist_to_goal):
-        reached = dist_to_goal < 0.5
-        timeout = self.progress_buf >= 3600  # Max steps should be set in config
+        reached = dist_to_goal < self.goal_radius
+        # Episode limit from `rl.max_episode_steps` (shipped 3600 = 120 s at 30 Hz).
+        timeout = self.progress_buf >= self.config['rl']['max_episode_steps']
         return reached | timeout
 
     def _compute_observations(self):
@@ -242,7 +249,7 @@ class RoombaRLEnv:
         dones = self._compute_dones(dist_to_goal)
 
         info = {
-            "success": (dist_to_goal < 0.5).clone(),
+            "success": (dist_to_goal < self.goal_radius).clone(),
             "progress": self.progress_buf.clone()
         }
 

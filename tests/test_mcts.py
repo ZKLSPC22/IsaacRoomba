@@ -81,7 +81,6 @@ GENEROUS_ENV_COUNT = 64
 DEFAULT_BASE_SECTION = {
     "c_param": 1.414,
     "num_iterations": 100,
-    "max_expansions": 300,
     "gamma": 0.95,
 }
 
@@ -368,12 +367,6 @@ class ValidationInvariantTests(SolverTestCase):
         solver = self.make_solver(mcts=mcts, num_envs=9)
         self.assertEqual(solver.num_actions, 9)
 
-    def test_max_expansions_below_action_count_raises(self):
-        mcts = {MCTS_ACTIONS_KEY: [[1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, -1.0], [1.0, -1.0]]}
-        base = dict(DEFAULT_BASE_SECTION, max_expansions=3)
-        with self.assertRaises(ValueError):
-            self.make_solver(mcts=mcts, base=base)
-
     def test_num_iterations_below_one_raises(self):
         base = dict(DEFAULT_BASE_SECTION, num_iterations=0)
         with self.assertRaises(ValueError):
@@ -397,7 +390,6 @@ class ValidationInvariantTests(SolverTestCase):
         for mcts, base in (
             ({MCTS_ACTIONS_KEY: []}, None),
             ({MCTS_ACTIONS_KEY: [[1.0, float(i) / 10.0] for i in range(10)]}, None),
-            ({MCTS_ACTIONS_KEY: [[1.0, 0.0]]}, dict(DEFAULT_BASE_SECTION, max_expansions=0)),
             ({MCTS_ACTIONS_KEY: [[1.0, 0.0]]}, dict(DEFAULT_BASE_SECTION, num_iterations=0)),
             ({MCTS_ACTIONS_KEY: [[1.0, 0.0]]}, dict(DEFAULT_BASE_SECTION, gamma=2.0)),
         ):

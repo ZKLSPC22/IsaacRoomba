@@ -1,6 +1,6 @@
 # IsaacRoomba Architecture
 
-Runtime behavior wins over source comments; stale comments are listed in §8. Related:
+Runtime behavior wins over source comments. Related:
 [`../README.md`](../README.md) (how to run), [`../ROADMAP.md`](../ROADMAP.md) (planned work),
 [`../AGENTS.md`](../AGENTS.md) (agent rules, condensed invariants).
 
@@ -14,11 +14,12 @@ Runtime behavior wins over source comments; stale comments are listed in §8. Re
 | `planners/` | search, node bookkeeping, backpropagation | `isaacgym`/`gym`, physics stepping, rewards, termination |
 | `scripts/` | driver loops, logging calls | reusable library logic |
 | `tracking/` | `run.yaml`/`steps.csv`/TensorBoard | planning/simulator logic |
+| `tracking/spatial_plotter.py` | headless 2D Matplotlib trajectory visualizer and flipbook frame generator | `isaacgym`, `torch`, simulator imports |
 | `configs/` | parameters only | code |
 | `tests/` | CPU-only unit tests | anything needing a GPU |
 
 Flow: `configs/*.yaml` -> `RoombaSimulator` (Isaac Gym, room, occupancy map, N envs, sensors) ->
-`RoombaPlanningEnv` (spaces, goals) -> `MCTSSolver` (15-action grid) -> `run_mcts.py` per step: fresh
+`RoombaPlanningEnv` (spaces, goals) -> `MCTSSolver` (explicit `mcts.actions` grid) -> `run_mcts.py` per step: fresh
 root -> `search` -> execute the best action via `generate()` -> `current_state = next_states[0]` ->
 CSV row, stopping on done / no-progress / horizon.
 
@@ -33,16 +34,19 @@ implements them. `core/__init__.py` and `envs/__init__.py` are empty; there is n
 8x1 wall); `room.type == "custom"` reads `custom.width`/`depth`/`obstacles`, anything else raises
 `ValueError`. Only `type: box` obstacles exist (others silently skipped). Required keys, direct-indexed
 so typos fail fast: `room.occupancy_map.resolution`, `room.occupancy_map.safety_margin`,
-`room.start_goal_sampling.min_distance`. Permissive fallbacks: custom `width`/`depth` -> 20.0,
-`obstacles` -> `[]`, missing `type` -> `custom`. `OccupancyMap` rasterizes, dilates, and samples valid
-poses on the CPU. `_calculate_dynamic_spacing()` sets `env_spacing = max(width, depth) + 2.0` (raises
-above 50.0) and **overwrites** `config['env']['env_spacing']`, so the YAML value is dead.
+`room.start_goal_sampling.min_distance`, `env.env_spacing`. Permissive fallbacks: `obstacles` -> `[]`,
+missing `type` -> `custom`; a custom room missing `width` or `depth` raises instead of defaulting.
+`OccupancyMap` rasterizes, dilates, samples valid poses, and precomputes the 8-connected free-space
+graph used for geodesic distance queries on the CPU. `_calculate_env_pitch()` sets
+the per-environment grid pitch to `max(width, depth) + env.env_spacing` (shipped buffer 2.0 m) and
+raises `ValueError` above 50.0; `env.env_spacing` is read from the config, never overwritten. The grid
+is `envs_per_row = int(sqrt(num_envs))` — 3x3 for the shipped 9.
 
 **Frames:** `UP_AXIS_Y`, gravity `(0, -9.81, 0)` — Y up, the robot drives in X–Z, +X forward (front
 marker x = 0.175), +Z right (chassis cylinder r = 0.17, wheels r = 0.036 at z = ±0.1175, a 0.235 m
 baseline = `L`). World positions are raw `root_states`; **room-local** subtracts `sim.env_origins`
 (`get_states` subtracts indices 0–2, `set_states` adds them back, velocity indices untouched).
-`sample_valid_pose()` returns room-local coordinates — its "world coordinate" docstring is stale.
+`sample_valid_pose()` returns room-local coordinates.
 
 **State** (`Box(shape=(15,))`, float32 on `env.device`): 0–2 `x,y,z` (room-local metres, `y` rests at
 0.065) · 3–6 `qx,qy,qz,qw` (**`qw` at index 6**) · 7–9 `vx,vy,vz` · 10–12 `wx,wy,wz` · 13–14
@@ -93,8 +97,9 @@ flipped), camera `(64, 64, 3)` (RGB facing +X). Shipped: bumper only, graphics o
 across `num_envs` on `env.device` with no per-env Python loops in the planner hot path. `_expand`
 makes one batched `generate()` call per node, writing the action grid into the leading `[:num_actions]`
 rows of a zero `[num_envs, 2]` tensor — **padded slots still advance physics** (waste =
-`num_envs - num_actions`; shipped 15 actions, 16 envs). The occupancy map is the sanctioned CPU
-exception.
+`num_envs - num_actions`; shipped 5 actions over 9 envs, so 4 padding slots advance physics). The
+occupancy map and its Dijkstra distance field are the sanctioned CPU exceptions, and the field is
+recomputed only when the goal changes (once per distinct goal, never per leaf).
 
 ## 4. Heuristic and MCTS
 
@@ -104,8 +109,41 @@ Task constants are owned by `task:` in `configs/config.yaml` (`goal_radius: 0.5`
 `collision_penalty: -5.0`, `step_cost: -0.1`); `planning_math` defines no constants or defaults — all
 are required keyword arguments.
 
+**Distance source: the 2D geodesic distance field.** The remaining distance is sampled from a
+precomputed obstacle-aware path-length field, not measured as a straight line, so a leaf behind a wall
+is valued by the detour it must drive rather than by the chord to the goal.
+
+`OccupancyMap` builds an 8-connected graph over free cells once in `__init__` (`scipy.sparse.csr_matrix`
+over `c_space_grid == 0`, flat index `u = gx * depth_cells + gz`, orthogonal step `resolution`, diagonal
+step `resolution * sqrt(2)`). A diagonal step is added only when **both** shared orthogonal neighbours
+are free, which prevents cutting corners through inflated obstacle cells.
+`OccupancyMap.compute_distance_field(goal_x, goal_z)` maps the goal to its cell (clamped), snaps to the
+nearest free cell when the goal sits inside an inflated margin, runs
+`scipy.sparse.csgraph.dijkstra(directed=False)`, and reshapes to a room-local
+`(width_cells, depth_cells)` float32 array of path lengths **in metres**. Cells that are occupied or
+unreachable from the goal are set to `max_finite + 2.0`, so the field is finite everywhere — that value
+is a finite upper bound, not a distance.
+
+`RoombaPlanningEnv._get_or_update_distance_field(goal_x, goal_z)` owns the GPU cache: the field depends
+only on the goal (the room layout is static), so it is computed once per distinct goal — within `1e-4` —
+and stored transposed as a `[1, 1, depth_cells, width_cells]` float32 tensor on `env.device`, with the
+tensor height axis mapped to Z/depth and the width axis to X/width. `compute_heuristic_values` reads the
+goal from `states[0, 13:15]` (valid because `_expand` replicates one parent state across the batch, so
+the batch shares one goal) and samples the field bilinearly:
+
 ```
-d_remain      = max(sqrt(dx^2 + dz^2) - goal_radius, 0)      # dx, dz = indices 13,14 minus 0,2
+norm_x = clamp(x / (room_width / 2), -1, 1);  norm_z = clamp(z / (room_depth / 2), -1, 1)
+grid   = stack([norm_x, norm_z], dim=-1)[None, None]         # [1, 1, batch, 2]
+dist_geodesic = grid_sample(field, grid, mode="bilinear",
+                            padding_mode="border", align_corners=True).view(-1)
+```
+
+`align_corners=True` maps normalized `-1`/`+1` onto the first/last **cell centres**, so the outer half
+cell of each axis is reachable only by the `clamp`/`border` behaviour; that boundary approximation is the
+cost of a stateless lookup and is well inside `goal_radius`.
+
+```
+d_remain      = max(dist_geodesic - goal_radius, 0)          # metres, clamped at the goal radius
 max_dist_step = max_linear_velocity * macro_action_duration  # 0.6 * 0.5 = 0.3 m
 H             = max(d_remain / max_dist_step, 1.0)
 V(s)          = gamma^(H-1) * goal_reward + step_cost * (1 - gamma^H) / (1 - gamma)  # 0 if terminal
@@ -113,27 +151,33 @@ V(s)          = gamma^(H-1) * goal_reward + step_cost * (1 - gamma^H) / (1 - gam
 
 `gamma == 1` gives `goal_reward + H * step_cost`. The heuristic is a **batched leaf value**, never a
 rollout: a value estimate, not reward shaping (PBRS would need an added
-$\gamma\,\Phi(s') - \Phi(s)$ reward term, which does not exist). It ignores collision risk, and shares
-`goal_radius` with the terminal check.
+$\gamma\,\Phi(s') - \Phi(s)$ reward term, which does not exist). It accounts for obstacle detours through
+the path length but still ignores collision **risk**, and shares `goal_radius` with the terminal check.
+Omitting `distance_field`, `room_width` and `room_depth` together falls back to the earlier
+`sqrt(dx^2 + dz^2)` straight-line distance (the function keeps its old name); no caller in the repository
+uses that path.
 
 **Parameters** (`configs/planners.yaml` `base.*`): `c_param` 1.414 (UCB1
-`Q/N + c_param*sqrt(ln(parent.N)/N)`, unvisited `+inf`), `num_iterations` 100, `max_expansions` 300,
-`gamma` 0.95. `MCTSSolver` builds `num_actions = 3 (mcts.v_vals) x 5 (mcts.omega_vals) = 15` and
-validates `num_actions > 0`, `num_actions <= num_envs`, `num_iterations >= 1`,
-`max_expansions >= num_actions`, `0 <= gamma <= 1`.
+`Q/N + c_param*sqrt(ln(parent.N)/N)`, unvisited `+inf`), `num_iterations` 100, `gamma` 0.95.
+`mcts.actions` is the explicit, ordered action set the solver loads directly — shipped 5
+`[linear_velocity, angular_velocity]` pairs (`[1.0, 0.0]`, `[1.0, 1.0]`, `[1.0, -1.0]`, `[0.0, 1.0]`,
+`[0.0, -1.0]`), with no stationary action. Index order is the action's identity in
+`node.action_taken`, the run log, and the `search()` tie-break, so it is never re-sorted or
+de-duplicated. There is no fallback grid: a missing key, a non-pair entry, a non-numeric component, or
+a component outside `[-1, 1]` raises at construction rather than being clamped or truncated.
+`MCTSSolver` validates `num_actions > 0`, `num_actions <= num_envs`, `num_iterations >= 1`,
+`0 <= gamma <= 1`.
 
-**`search`**: return `None` for a terminal root; expand the root (all 15 children with rewards,
-terminal flags, heuristic values); loop while `iteration < num_iterations` and
-`num_expansions < max_expansions`, doing UCB1 descent, expanding only when the node is non-terminal
+**`search`**: return `None` for a terminal root; expand the root (all `num_actions` children with rewards,
+terminal flags, heuristic values); loop while `iteration < num_iterations`, doing UCB1 descent, expanding only when the node is non-terminal
 **and** `N > 0`, then backpropagating `value = node.reward + gamma * value`, `N += 1`, `Q += value` to
 the root (the root itself adds no reward step); return the best root child by `Q/N` if `N > 0`, else
 `reward + gamma * heuristic_value`, or `None` when there are no children. `_expand` returns a
 **randomly chosen child** for the next phase, so `Q/N` is not an unbiased action-value.
 
-Semantics gaps: both counters gate the same loop in unrelated units (one expansion = 15 children; one
-iteration = one selection + one backprop), so either can end the search; expansion requiring `N > 0`
-means iterations can be spent re-backpropagating a visited leaf; there is no time-, tick-, or call-based
-budget. **No tree reuse** — `run_mcts.py` builds a fresh root inside the execution loop and discards
+The loop is gated by `num_iterations` alone (one iteration = one selection plus one backprop, while one
+expansion creates `num_actions` children); expansion requiring `N > 0` means iterations can be spent
+re-backpropagating a visited leaf, and there is no time-, tick-, or call-based budget. **No tree reuse** — `run_mcts.py` builds a fresh root inside the execution loop and discards
 the tree, keeping only `count_nodes`/`tree_depth`.
 
 ## 5. Rewards and termination
@@ -145,8 +189,8 @@ planning:  reached = dist < goal_radius
            reward  = reached*goal_reward + bumped*collision_penalty + step_cost   # +10 / -5 / -0.1
            done    = reached                                    # no timeout in the env
 rl:        progress = max(min_dist - dist, 0); min_dist = min(min_dist, dist)    # high-water mark
-           reward   = progress*5.0 + reached*10.0 - bumped*5.0
-           done     = reached | (progress_buf >= 3600)          # 3600 hard-coded
+           reward   = progress*rl.progress_weight + reached*10.0 - bumped*task.collision_penalty
+           done     = reached | (progress_buf >= rl.max_episode_steps)
 ```
 
 `bumped` is the OR-accumulated bumper mask (all-`False` when disabled) and the planning step cost is
@@ -160,22 +204,65 @@ robot, room, and simulator but have independent rewards, termination, and contro
 
 | File | Owns |
 | --- | --- |
-| `configs/config.yaml` | `env.num_rl_envs` (1), `env.num_planning_envs` (16), dead `env.env_spacing`, `planning.macro_action_ticks`, `room.*`, `task.*`, `sensors.*`, `robot.*` |
-| `configs/planners.yaml` | `base.*`, `mcts.*`, unused `pomcgs.*` |
+| `configs/config.yaml` | `env.num_rl_envs` (9), `env.num_planning_envs` (9), `env.env_spacing` (2.0 m grid buffer), `planning.macro_action_ticks`, `rl.max_episode_steps`, `rl.progress_weight`, `room.*`, `task.*`, `sensors.*`, `robot.*` |
+| `configs/planners.yaml` | `base.*`, `mcts.actions` and `mcts.*`, unused `pomcgs.*` |
 | `configs/experiments.yaml` | `mcts.seed`, `mcts.max_execution_steps`, `mcts.no_progress.*`, `mcts.logging.*` |
+
+`mcts.logging` holds `output_dir`, `tensorboard`, and `render_frames`: the last is the on/off switch for
+the PNG flipbook, read by `scripts/run_mcts.py` as `bool(logging_cfg.get("render_frames", False))` and
+forwarded to `MCTSRunLogger(enable_visualizer=...)`, so a config that omits the key draws no frames.
+The toggle controls *rendering only*: `tracking/run_logger.py` imports `TrajectoryVisualizer`
+unconditionally, so importing `tracking` (and therefore running `scripts/run_mcts.py`) requires
+matplotlib at import time whether or not frames are enabled.
 
 Paths are relative and `robot.urdf_path` is `"roomba.urdf"` loaded via `load_asset(self.sim, ".")`, so
 **scripts must run from the repository root**.
 
 `tracking/run_logger.py` writes `logs/mcts/mcts_<UTC>/` containing `run.yaml` (`schema_version: 1`:
 resolved config, Git commit + dirty flag, scenario, result; written `running` first, finalized on every
-exit path, atomic replace), `steps.csv` (one flushed row per executed action; column names carry units:
-`step`, `action_v_normalized`, `action_w_normalized`, `root_value` = `root.Q/root.N`, `tree_size`,
+exit path, atomic replace), `steps.csv` (one flushed row per executed action; column names carry units
+except for the planar pose: `step`, `robot_x`, `robot_z`, `robot_yaw` (metres and radians in the same
+Y-up / X-forward / Z-right frame the renderer draws; `robot_yaw` is the planar angle whose
+`(cos, sin)` is the robot's forward direction, so a `+Z` turn about world `+Y` yields a negative yaw),
+`action_v_normalized`, `action_w_normalized`, `root_value` = `root.Q/root.N`, `tree_size`,
 `max_depth`, `distance_to_goal_m`, `executed_reward`, `search_time_sec`, `execution_time_sec`,
 `expansion_calls`, `physics_ticks`, `decisions_per_sec`), and TensorBoard derived from the same metrics
 dict (`TensorBoardUnavailableError` if enabled without the package). Termination reasons:
 `goal_reached`, `no_progress`, `execution_horizon`, `interrupted`, `error`. `logs/` is git-ignored but
 13 older CSVs remain tracked; `seed_everything(seed)` seeds NumPy and Torch.
+
+### Frame flipbook (`frames/step_XXX.png`)
+
+When `render_frames` is true, each logged step additionally writes
+`<run_dir>/frames/step_<step:03d>.png` (`step_000` is the pre-action spawn pose logged before the
+execution loop). Rendering is derived and fully shielded: `log_step` writes the CSV row and TensorBoard
+scalars first, then renders inside `try/except Exception`, so a plotting failure loses only the frame
+and never a data record. CSV, TensorBoard, and frames all come from one metrics dict. An empty
+`frames/` directory is still left behind if rendering fails or a replay is refused, since the directory
+is created by the visualizer's constructor.
+
+`tracking/spatial_plotter.py::TrajectoryVisualizer` composes each frame from four independent layers,
+drawn in this order:
+
+| Layer | Content | Notes |
+| --- | --- | --- |
+| 1. Static scene | room outline, obstacle bodies, dashed inflated obstacle footprints, goal disc + cross | geometry only; redrawn from constructor parameters |
+| 2. Kinematics | breadcrumb trail (only with >= 2 poses), robot body, heading arrow | `cos(yaw)`/`sin(yaw)` arrow; trail accumulates in `history_x`/`history_z` |
+| 3. Delegate overlay | caller-supplied `overlay_fn(ax)`, skipped when `None` | receives the live `Axes`; nothing algorithm-specific is assumed |
+| 4. Diagnostic HUD | optional `hud_metrics` rendered verbatim as key/value lines | skipped when `None` or `{}`; values are stringified generically |
+
+The module is importable and testable without Isaac Gym, CUDA, PyTorch, or matplotlib interaction: it
+selects the `Agg` backend before importing `pyplot`, closes every figure in a `finally`, and duplicates
+the `core.room` presets as constants (`EMPTY_ROOM_BOUNDS`/`STANDARD_ROOM_*`) rather than importing
+`core.room`, which pulls in `isaacgym`. The `standard` preset wall is `x=5.0, z=5.0, width=8.0,
+depth=1.0`, matching `Room.standard()`.
+
+Offline replay needs no simulator: `TrajectoryVisualizer.from_run_log(run_dir)` reconstructs room
+geometry (from `scenario.geometry` when recorded, else the preset name in
+`configuration.environment.room.type`), radii, and goal from `run.yaml`, and `render_from_csv`
+re-renders a `steps.csv` into frames, raising `ValueError` if the pose columns are absent.
+`scripts/render_trajectory.py` exposes this as a CLI (`--gif`, `--fps`) writing `<run_dir>/trajectory.gif`.
+CSVs logged before the pose columns existed cannot be replayed.
 
 ## 7. Invariants and known limitations
 
@@ -185,26 +272,21 @@ X-forward, Z-right frame; planners reach the world only through `generate()` and
 `compute_heuristic_values`; rewards and termination stay in `envs/`; hot paths stay GPU-batched;
 teleports keep resetting wheel DOF state and place robots at resting height;
 `num_actions <= num_planning_envs`; macro-action duration is `macro_action_ticks * (1/30)` s and is
-shared with the heuristic.
+shared with the heuristic; the cached distance field is built for one goal and normalized by the room
+extents, so the field, `states[:, 13:15]`, and `sim.room` must always describe the same goal and room;
+`STEP_COLUMNS` is one schema with three consumers, so changing it means changing `run_logger.py`,
+`scripts/run_mcts.py`, and `tests/test_run_logger.py` together, and frames stay derived (never
+authoritative) so a rendering failure cannot change or truncate a logged record.
 
 Limitations: no tree reuse; count-based budgets only; fully observable only; padded slots waste
-physics; `RoombaRLEnv` duplicates reward constants instead of reading `task.*`; dead configuration
-(`env.env_spacing`, `pomcgs.*`); `_extract_physical_state` is never called; mixed configuration
-strictness; CPU occupancy-map serialization; an extra GPU sync per transition; `search()` can return
-`None` while `run_mcts.py` indexes `mcts.actions[best_action_idx]` unguarded (only the initial
-already-at-goal case is guarded); dead viewer-close checks in the RL scripts; a stray `import torch` in
-`random_rl.py`; the untracked, currently red `tests/`.
+physics (`num_envs - num_actions`); matplotlib is an undeclared import-time dependency of `tracking/`
+even when `render_frames` is false, and every `steps.csv` written before the pose columns existed is
+unreplayable; `RoombaRLEnv` reads `task.goal_radius` and `rl.*`, but its goal term still hard-codes
+`10.0` instead of `task.goal_reward`; `pomcgs.*` is configured
+but never read; `_extract_physical_state` is never called; mixed configuration strictness; CPU
+occupancy-map serialization plus one CPU Dijkstra per distinct goal; an extra GPU sync per transition; dead viewer-close checks in the RL
+scripts (`step()` never returns `False`); `tests/` is tracked and CPU-only.
 
 Open questions (tracked in [`../ROADMAP.md`](../ROADMAP.md)): time/tick-based budgets; tree reuse and
 `N`/`Q` correction on re-rooting; one shared objective for planning and RL; the POMCGS belief
 representation.
-
-## 8. Stale code text to fix
-
-| Location | Actual behavior |
-| --- | --- |
-| `envs/planning_env.py`, `generate()` step 3 | says "default 30 ticks = 0.5s at 60Hz"; physics is 30 Hz and the configured macro-action is 15 ticks |
-| `core/room.py`, `sample_valid_pose` docstring | says "world coordinate"; returns room-local |
-| `core/room.py`, `sample_valid_start_goal` error | names `min_start_goal_dist`; key is `room.start_goal_sampling.min_distance` |
-| `envs/rl_env.py`, `_compute_dones` comment | says the max steps should be configured; `3600` is hard-coded |
-| `core/room.py`, `BoxObstacle.spawn` actor name | typo `"box_obstaclconfige"`; cosmetic |

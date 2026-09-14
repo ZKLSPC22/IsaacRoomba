@@ -22,7 +22,13 @@ Scope and non-goals
   PBRS would require an added reward term of the form
   ``gamma * Phi(next_state) - Phi(state)``, which does not exist in this
   codebase. See `ROADMAP.md` for the deferred PBRS investigation.
+- The heuristic's distance comes from a precomputed 2D geodesic distance field
+  sampled with ``torch.nn.functional.grid_sample`` when ``distance_field``,
+  ``room_width`` and ``room_depth`` are supplied; with all three omitted it falls
+  back to the Euclidean straight-line distance (the pre-geodesic behavior).
 - The heuristic deliberately ignores collision risk; that is existing behavior.
+  Geodesic mode accounts for obstacles only through the length of the path, not
+  through contact risk.
 """
 
 from __future__ import annotations
@@ -94,12 +100,48 @@ def compute_straight_line_heuristic(
     goal_radius: float,
     goal_reward: float,
     step_cost: float,
+    distance_field: torch.Tensor | None = None,
+    room_width: float | None = None,
+    room_depth: float | None = None,
 ) -> torch.Tensor:
-    """Discounted-return estimate for an ideal straight-line path to the goal.
+    """Discounted-return estimate for an ideal collision-free path to the goal.
 
-    Estimates the expected discounted return of driving straight at maximum speed
-    from each state to the goal, which gives MCTS leaves a stable, discountable
-    value without the cost and variance of rollouts.
+    Estimates the expected discounted return of driving at maximum speed along the
+    ideal path from each state to the goal, which gives MCTS leaves a stable,
+    discountable value without the cost and variance of rollouts.
+
+    Distance source
+    ---------------
+    Two mutually exclusive modes, selected by whether the geodesic arguments are
+    supplied:
+
+    * **Geodesic (preferred)** — ``distance_field``, ``room_width`` and
+      ``room_depth`` are all given. The remaining distance is sampled from a
+      precomputed 2D distance field produced by
+      ``OccupancyMap.compute_distance_field``, so the estimate accounts for
+      obstacles instead of assuming a clear line of sight.
+    * **Straight-line (legacy)** — all three are ``None``. The remaining distance
+      is the Euclidean distance from the state to the goal stored in the state
+      itself. This is the pre-geodesic behavior, retained until every caller
+      passes a field.
+
+    Supplying only some of the three raises ``ValueError``: a partial set would
+    silently change which distance the search optimizes.
+
+    Sampling
+    --------
+    Room-local ``x``/``z`` are normalized to the ``[-1, 1]`` cube that
+    ``grid_sample`` expects and looked up bilinearly::
+
+        norm_x = clamp(x / (room_width / 2), -1, 1)
+        norm_z = clamp(z / (room_depth / 2), -1, 1)
+        grid = stack([norm_x, norm_z], dim=-1)[None, None]        # [1, 1, batch, 2]
+        geodesic = grid_sample(distance_field, grid, mode="bilinear",
+                               padding_mode="border", align_corners=True).view(-1)
+
+    ``align_corners=True`` maps the normalized ``-1``/``+1`` extremes onto the
+    field's first and last cell centres, and ``padding_mode="border"`` clamps
+    out-of-room poses to the border instead of returning NaN.
 
     Horizon estimation::
 
@@ -121,7 +163,8 @@ def compute_straight_line_heuristic(
 
     Args:
         states: ``[batch, 15]`` explicit states; indices 0/2 are room-local ``x``/``z``
-            and 13/14 are the room-local goal ``x``/``z``.
+            and 13/14 are the room-local goal ``x``/``z`` (used only in
+            straight-line mode).
         is_terminal: Boolean mask, per batch entry. Terminal entries return ``0``.
         gamma: Discount factor in ``[0, 1]``.
         max_linear_velocity: Robot speed limit in m/s.
@@ -130,19 +173,60 @@ def compute_straight_line_heuristic(
         goal_radius: Distance (m) at which the goal counts as reached.
         goal_reward: Reward assumed for the terminal goal step.
         step_cost: Reward assumed for every macro-action.
+        distance_field: ``[1, 1, depth_cells, width_cells]`` float geodesic
+            distance field in metres, with the height axis mapped to ``z``.
+        room_width: Full room extent (m) along ``x``, used for normalization.
+        room_depth: Full room extent (m) along ``z``, used for normalization.
 
     Returns:
-        A float tensor of shape ``[batch]``, on the same device and with the same
-        dtype as the computation over ``states``. Input tensors are not mutated.
+        A float tensor of shape ``[batch]``, on the same device as ``states``.
+        The dtype follows the computation: it matches ``states`` in straight-line
+        mode, and is the promotion of ``states`` and ``distance_field`` in
+        geodesic mode (a float32 field over float64 states yields float64). Input
+        tensors are not mutated.
 
     Note:
         This is a value estimate, not a reward. It is not PBRS, and it omits
         collision risk by design. ``collision_penalty`` is intentionally not a
         parameter here because the heuristic models a collision-free path.
+
+        The goal is read from the distance field in geodesic mode, so the field
+        must have been computed for the same goal as ``states[:, 13:15]``.
+
+    Raises:
+        ValueError: If only some of ``distance_field``, ``room_width`` and
+            ``room_depth`` are supplied.
     """
-    dx = states[:, _STATE_GOAL_X_INDEX] - states[:, _STATE_X_INDEX]
-    dz = states[:, _STATE_GOAL_Z_INDEX] - states[:, _STATE_Z_INDEX]
-    distance = torch.sqrt(dx * dx + dz * dz)
+    geodesic_parts = (distance_field is not None, room_width is not None, room_depth is not None)
+    if any(geodesic_parts) and not all(geodesic_parts):
+        raise ValueError(
+            "compute_straight_line_heuristic received a partial geodesic "
+            "configuration: pass all of `distance_field`, `room_width` and "
+            "`room_depth`, or none of them to use the straight-line distance."
+        )
+
+    if distance_field is None:
+        # Legacy mode: a clear line of sight, ignoring obstacles.
+        dx = states[:, _STATE_GOAL_X_INDEX] - states[:, _STATE_X_INDEX]
+        dz = states[:, _STATE_GOAL_Z_INDEX] - states[:, _STATE_Z_INDEX]
+        distance = torch.sqrt(dx * dx + dz * dz)
+    else:
+        norm_x = (states[:, _STATE_X_INDEX] / (room_width / 2.0)).clamp(-1.0, 1.0)
+        norm_z = (states[:, _STATE_Z_INDEX] / (room_depth / 2.0)).clamp(-1.0, 1.0)
+
+        # `grid_sample` requires the grid to share the input's dtype; the states
+        # may be float64 while the cached field is float32.
+        grid = torch.stack([norm_x, norm_z], dim=-1).to(dtype=distance_field.dtype)
+        grid = grid.unsqueeze(0).unsqueeze(0)
+
+        sampled = torch.nn.functional.grid_sample(
+            distance_field,
+            grid,
+            mode="nearest",
+            padding_mode="border",
+            align_corners=True,
+        )
+        distance = sampled.view(-1).to(torch.promote_types(states.dtype, distance_field.dtype))
 
     # 1. Estimate steps to goal (H)
     max_dist_per_step = max_linear_velocity * macro_action_duration

@@ -35,11 +35,11 @@ class BaseSearcher:
         self.c_param = base_cfg.get('c_param', 1.414)
         self.num_iterations = base_cfg.get('num_iterations', 100)
         self.gamma = base_cfg.get('gamma', 0.99)
-        self.max_expansions = base_cfg.get('max_expansions', 15)
 
         # Number of node expansions (== generate() calls) in the last search.
         self.num_expansions = 0
 
+    # This method returns None when root search node is terminal or have no children, remember to guard against None when using this method
     def search(self, root_node, num_iterations=None):
         iters = num_iterations if num_iterations is not None else self.num_iterations
 
@@ -51,11 +51,10 @@ class BaseSearcher:
             return None
 
         # Expand the root immediately (if the budget permits) to populate children.
-        if self.num_expansions < self.max_expansions:
-            self._expand(root_node)
+        self._expand(root_node)
 
         iteration = 0
-        while iteration < iters and self.num_expansions < self.max_expansions:
+        while iteration < iters:
             iteration += 1
 
             # 1. Selection

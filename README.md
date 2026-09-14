@@ -21,7 +21,7 @@ envs/          planning_env.py (G(s,a)), rl_env.py, planning_math.py
 planners/      base.py, mcts.py
 scripts/       run_mcts.py, random_rl.py, debug_rl.py
 tracking/      run_logger.py
-tests/         CPU-only tests (untracked, currently failing)
+tests/         CPU-only tests (tracked; no GPU needed)
 logs/mcts/     generated run logs (git-ignored; older CSVs still tracked)
 ```
 
@@ -48,23 +48,23 @@ python scripts/debug_rl.py     # manual control (viewer on, needs OpenCV)
 `run_mcts.py` is the only implemented planner experiment: it seeds NumPy/Torch from `mcts.seed`
 (`configs/experiments.yaml`), samples a collision-free start/goal pair at least
 `room.start_goal_sampling.min_distance` apart, then runs the search/execute loop. It requires
-`num_planning_envs` >= the action-grid size (shipped: 15 actions, 16 envs).
+`num_planning_envs` >= the action-grid size (shipped: 5 actions from `mcts.actions`, 9 envs).
 
 ## Config, logs, tests
 
 - One owner per file: `configs/config.yaml` (env/room/task/sensors/robot), `configs/planners.yaml`
-  (planner), `configs/experiments.yaml` (runner). `env.env_spacing` is overwritten at simulator
-  construction, so the configured value never applies.
+  (planner: `base.*`, `mcts.actions`), `configs/experiments.yaml` (runner). `env.env_spacing` is the
+  buffer between adjacent rooms: the per-environment pitch is `max(room width, depth) + env_spacing`,
+  read from the config rather than overwritten.
 - One directory per run: `logs/mcts/mcts_<UTC>/{run.yaml,steps.csv,tensorboard/}`. `run.yaml`
   (`schema_version: 1`) and `steps.csv` are the portable source of truth; TensorBoard is derived from
   the same metrics. Logging lives in `tracking/run_logger.py`.
-- `python -m unittest discover -s tests -v` — `tests/` is untracked and currently **red**. Two files
-  target current code (`test_run_logger.py`, `test_planning_math.py`); `test_mcts.py` and
-  `test_env_layout.py` specify an unimplemented refactor (`core/env_layout.py`, explicit
-  `mcts.actions`, `num_planning_envs: 9`) — treat them as a spec, not as truth.
+- `python -m unittest discover -s tests -v` — `tests/` is tracked and CPU-only (no GPU needed). It
+  covers shipped code: `test_run_logger.py`, `test_planning_math.py`, and `test_mcts.py`, which
+  asserts the explicit action set actually shipped (`mcts.actions`, 5 actions, `num_planning_envs: 9`).
 
 ## Docs
 
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — architecture, invariants, limitations, stale-comment
-list (read first) · [`ROADMAP.md`](ROADMAP.md) — milestone, planned experiments, deferred decisions ·
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — architecture, invariants, limitations (read first) ·
+[`ROADMAP.md`](ROADMAP.md) — milestone, planned experiments, deferred decisions ·
 [`AGENTS.md`](AGENTS.md) — rules for contributors and coding agents.

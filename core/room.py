@@ -7,6 +7,8 @@ import math
 import numpy as np
 from isaacgym import gymapi
 from scipy.ndimage import binary_dilation
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
 
 
 @dataclass
@@ -34,7 +36,7 @@ class BoxObstacle(Obstacle):
         pose.p = gymapi.Vec3(self.x, height / 2.0, self.z)
         
         actor_handle = gym.create_actor(
-            env_ptr, asset, pose, "box_obstaclconfige", group=-1, filter=0
+            env_ptr, asset, pose, "box_obstacle", group=-1, filter=0
         )
 
         return actor_handle
@@ -102,6 +104,7 @@ class Room:
 
 class OccupancyMap:
     def __init__(self, room: Room, resolution, robot_radius, safety_margin, min_start_goal_dist):
+        self.room = room
         self.res = resolution
         self.width_cells = int(room.width / resolution)
         self.depth_cells = int(room.depth / resolution)
@@ -141,8 +144,67 @@ class OccupancyMap:
         valid_x, valid_z = np.where(self.c_space_grid == 0)
         self.valid_cells = list(zip(valid_x, valid_z))
 
+        # 3. Precompute the 8-connected free-space graph for geodesic queries.
+        # Flat index convention: u = gx * self.depth_cells + gz.
+        num_cells = self.width_cells * self.depth_cells
+        free = self.c_space_grid == 0
+        source_x, source_z = np.where(free)
+
+        rows: List[int] = []
+        cols: List[int] = []
+        weights: List[float] = []
+
+        orthogonal_offsets = ((-1, 0), (1, 0), (0, -1), (0, 1))
+        diagonal_offsets = ((-1, -1), (-1, 1), (1, -1), (1, 1))
+
+        for dx, dz in orthogonal_offsets + diagonal_offsets:
+            neighbor_x = source_x + dx
+            neighbor_z = source_z + dz
+
+            in_bounds = (
+                (neighbor_x >= 0) & (neighbor_x < self.width_cells)
+                & (neighbor_z >= 0) & (neighbor_z < self.depth_cells)
+            )
+            if not np.any(in_bounds):
+                continue
+
+            src_x = source_x[in_bounds]
+            src_z = source_z[in_bounds]
+            dst_x = neighbor_x[in_bounds]
+            dst_z = neighbor_z[in_bounds]
+
+            passable = free[dst_x, dst_z]
+
+            is_diagonal = dx != 0 and dz != 0
+            if is_diagonal:
+                # No corner cutting: a diagonal step is only legal when both
+                # orthogonal cells sharing that corner are free too.
+                passable &= free[dst_x, src_z] & free[src_x, dst_z]
+
+            src_x = src_x[passable]
+            src_z = src_z[passable]
+            dst_x = dst_x[passable]
+            dst_z = dst_z[passable]
+
+            rows.extend((src_x * self.depth_cells + src_z).tolist())
+            cols.extend((dst_x * self.depth_cells + dst_z).tolist())
+            weight = float(self.res * math.sqrt(2)) if is_diagonal else float(self.res)
+            weights.extend([weight] * src_x.size)
+
+        self.graph = csr_matrix(
+            (
+                np.asarray(weights, dtype=np.float32),
+                (
+                    np.asarray(rows, dtype=np.int64),
+                    np.asarray(cols, dtype=np.int64),
+                ),
+            ),
+            shape=(num_cells, num_cells),
+            dtype=np.float32,
+        )
+
     def sample_valid_pose(self): # Used to randomly set initial and end position
-        """Returns a guaranteed collision-free (X, Z) world coordinate."""
+        """Returns a guaranteed collision-free room-local (X, Z) coordinate."""
         idx = np.random.randint(len(self.valid_cells))
         gx, gz = self.valid_cells[idx]
         
@@ -172,6 +234,52 @@ class OccupancyMap:
         raise ValueError(
             f"Could not sample a start/goal pair at least {min_dist} m apart "
             f"after {max_attempts} attempts. Check room dimensions and "
-            "min_start_goal_dist."
+            "room.start_goal_sampling.min_distance."
         )
+
+    def compute_distance_field(self, goal_x: float, goal_z: float) -> np.ndarray:
+        """Shortest obstacle-aware path distance from every cell to a goal.
+
+        Returns a room-local field of shape ``(width_cells, depth_cells)`` in
+        metres, indexed ``[gx, gz]`` with the same cell convention as
+        ``sample_valid_pose``. Values come from Dijkstra over ``self.graph``,
+        whose edge weights are metric (``res`` and ``res * sqrt(2)``), so the
+        result is a geodesic distance rather than a hop count and is never
+        smaller than the straight-line distance.
+
+        A goal inside the inflated obstacle margin is snapped to the nearest
+        free cell (the field then measures distance to that cell, because the
+        graph contains no node for an occupied cell). Cells that are occupied
+        or unreachable from the goal are assigned ``max_finite + 2.0`` so the
+        field is finite and finite-differencing or interpolation over it never
+        produces NaN or inf.
+        """
+        half_width = self.width_cells * self.res / 2.0
+        half_depth = self.depth_cells * self.res / 2.0
+
+        gx = min(max(int((goal_x + half_width) / self.res), 0), self.width_cells - 1)
+        gz = min(max(int((goal_z + half_depth) / self.res), 0), self.depth_cells - 1)
+
+        if self.c_space_grid[gx, gz] != 0:
+            # Snap to the nearest free cell so Dijkstra has a valid source node.
+            free_x, free_z = np.array(self.valid_cells, dtype=np.int64).T
+            nearest = int(np.argmin((free_x - gx) ** 2 + (free_z - gz) ** 2))
+            gx = int(free_x[nearest])
+            gz = int(free_z[nearest])
+
+        # 2D to 1D flattening
+        goal_node = gx * self.depth_cells + gz
+        dist_1d = dijkstra(csgraph=self.graph, directed=False, indices=goal_node)
+        dist_2d = np.asarray(dist_1d, dtype=np.float64).reshape(
+            self.width_cells, self.depth_cells
+        )
+
+        reachable = np.isfinite(dist_2d)
+        max_val = float(np.max(dist_2d[reachable])) if np.any(reachable) else 0.0
+        fallback = np.float64(max_val + 2.0)
+
+        free_and_reachable = reachable & (self.c_space_grid == 0)
+        dist_2d = np.where(free_and_reachable, dist_2d, fallback)
+
+        return dist_2d.astype(np.float32)
     

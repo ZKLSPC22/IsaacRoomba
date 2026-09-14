@@ -43,6 +43,13 @@ def tree_depth(node):
         return 0
     return 1 + max(tree_depth(child) for child in node.children.values())
 
+def extract_yaw_from_quaternion(qy: float, qw: float) -> float:
+    """Compute planar yaw angle (radians) in 2D top-down (X=horizontal, Z=vertical) frame.
+
+    In Y-up frame (+X forward, +Z right), a CCW yaw rotates forward (+X) into -Z.
+    """
+    return math.atan2(-2.0 * qy * qw, qw * qw - qy * qy)
+
 def _finalize_safely(run_logger, **kwargs):
     """Finalize a run without masking the exception that triggered finalization."""
     try:
@@ -69,7 +76,7 @@ def main():
     seed_everything(seed)
 
     print("Initializing Planning Environment...")
-    # NOTE: num_planning_envs (16) must be >= the discrete action grid size (15).
+    # NOTE: num_planning_envs (9) must be >= the discrete action grid size (5).
     # Pre-initialised so the exception handlers can finalize safely even if the
     # failure happens before the execution loop starts.
     env = None
@@ -77,7 +84,7 @@ def main():
     steps = 0
     final_dist = None
     try:
-        env = RoombaPlanningEnv(config_path="configs/config.yaml", sim_device="cuda:0", show_viewer=True)
+        env = RoombaPlanningEnv(config_path="configs/config.yaml", sim_device="cuda:0", show_viewer=False)
 
         print("Initializing Leaf-Parallel MCTS...")
         # Requires configs/planners.yaml to exist
@@ -106,14 +113,21 @@ def main():
         initial_dx = current_state[13] - current_state[0]
         initial_dz = current_state[14] - current_state[2]
         initial_dist = math.hypot(initial_dx.item(), initial_dz.item())
-        if initial_dist < 0.5:
+        if initial_dist < env.goal_radius:
             print("Sampled start already satisfies the goal; skipping search.")
             return
 
         # 4. Setup Run Logging
         # Each run owns a directory holding the authoritative run.yaml and steps.csv
-        # records, plus a derived TensorBoard event directory when enabled.
+        # records, plus a derived TensorBoard event directory and/or 2D frame
+        # flipbook when those logging options are enabled.
         logging_cfg = mcts_experiment_cfg["logging"]
+        room_bounds = (float(env.sim.room.width), float(env.sim.room.depth))
+        obstacles = [
+            {"x": float(o.x), "z": float(o.z), "width": float(o.width), "depth": float(o.depth)}
+            for o in env.sim.room.obstacles
+            if hasattr(o, "width")
+        ]
         run_logger = MCTSRunLogger(
             output_dir=logging_cfg["output_dir"],
             environment_config=env.config,
@@ -126,6 +140,36 @@ def main():
             },
             initial_distance=initial_dist,
             enable_tensorboard=bool(logging_cfg["tensorboard"]),
+            enable_visualizer=bool(logging_cfg.get("render_frames", False)),
+            room_bounds=room_bounds,
+            obstacles=obstacles,
+            goal=(goal_x, goal_z),
+            goal_radius=env.goal_radius,
+        )
+
+        # Step 0 records the spawn pose before any action is taken, so a flipbook
+        # starts at the sampled start instead of the first post-action state.
+        initial_yaw = extract_yaw_from_quaternion(current_state[4].item(), current_state[6].item())
+        run_logger.log_step(
+            {
+                "step": 0,
+                "robot_x": round(start_x, 4),
+                "robot_z": round(start_z, 4),
+                "robot_yaw": round(initial_yaw, 4),
+                "action_v_normalized": 0.0,
+                "action_w_normalized": 0.0,
+                "root_value": 0.0,
+                "tree_size": 1,
+                "max_depth": 0,
+                "distance_to_goal_m": round(initial_dist, 4),
+                "executed_reward": 0.0,
+                "search_time_sec": 0.0,
+                "execution_time_sec": 0.0,
+                "expansion_calls": 0,
+                "physics_ticks": 0,
+                "decisions_per_sec": 0.0,
+            },
+            hud_metrics={"Status": "Spawn Pose", "Dist": f"{initial_dist:.2f}m"},
         )
 
         print(f"Logging initialized at: {run_logger.run_dir}")
@@ -144,6 +188,13 @@ def main():
             search_start = time.perf_counter()
             ticks_before_search = env.sim.physics_tick_count
             best_action_idx = mcts.search(root)
+            if best_action_idx is None:
+                if root.is_terminal:
+                    termination_reason = TERMINATION_GOAL_REACHED
+                    break
+                raise RuntimeError(
+                    "Search ran on a terminal node or a node with no children."
+                )
             search_time = time.perf_counter() - search_start
             search_ticks = env.sim.physics_tick_count - ticks_before_search
 
@@ -177,25 +228,48 @@ def main():
             dist_to_goal = math.hypot(dx.item(), dz.item())
             final_dist = dist_to_goal
 
+            # Planar pose of the executed state. The yaw uses the same planar
+            # convention as the frame renderer, so the drawn heading matches the
+            # physical robot orientation.
+            robot_x = current_state[0].item()
+            robot_z = current_state[2].item()
+            robot_yaw = extract_yaw_from_quaternion(current_state[4].item(), current_state[6].item())
+
+            # HUD card contents: observability aids only, never a data source.
+            hud_metrics = {
+                "Step": f"{steps:03d}",
+                "Dist": f"{dist_to_goal:.2f}m",
+                "Action": f"v={best_action[0]:.1f}, w={best_action[1]:.1f}",
+                "Root Q/N": f"{root_value:.3f}",
+                "Nodes": tree_size,
+                "Expansions": num_expansions,
+            }
+
             # --- LOGGING ---
-            # One metrics dictionary feeds both CSV and TensorBoard, so the two
-            # representations cannot drift. CSV is flushed per row to protect
-            # against KeyboardInterrupt.
-            run_logger.log_step({
-                "step": steps,
-                "action_v_normalized": round(best_action[0].item(), 2),
-                "action_w_normalized": round(best_action[1].item(), 2),
-                "root_value": round(root_value, 4),
-                "tree_size": tree_size,
-                "max_depth": max_depth,
-                "distance_to_goal_m": round(dist_to_goal, 4),
-                "executed_reward": round(float(exec_rewards[0].item()), 4),
-                "search_time_sec": round(search_time, 6),
-                "execution_time_sec": round(exec_time, 6),
-                "expansion_calls": num_expansions,
-                "physics_ticks": physx_ticks,
-                "decisions_per_sec": round(decisions_per_sec, 4),
-            })
+            # One metrics dictionary feeds CSV, TensorBoard, and the optional frame
+            # flipbook, so the three representations cannot drift. CSV is flushed
+            # per row to protect against KeyboardInterrupt.
+            run_logger.log_step(
+                {
+                    "step": steps,
+                    "robot_x": round(robot_x, 4),
+                    "robot_z": round(robot_z, 4),
+                    "robot_yaw": round(robot_yaw, 4),
+                    "action_v_normalized": round(best_action[0].item(), 2),
+                    "action_w_normalized": round(best_action[1].item(), 2),
+                    "root_value": round(root_value, 4),
+                    "tree_size": tree_size,
+                    "max_depth": max_depth,
+                    "distance_to_goal_m": round(dist_to_goal, 4),
+                    "executed_reward": round(float(exec_rewards[0].item()), 4),
+                    "search_time_sec": round(search_time, 6),
+                    "execution_time_sec": round(exec_time, 6),
+                    "expansion_calls": num_expansions,
+                    "physics_ticks": physx_ticks,
+                    "decisions_per_sec": round(decisions_per_sec, 4),
+                },
+                hud_metrics=hud_metrics,
+            )
 
             print(f"Step: {steps:03d} | v={best_action[0]:.2f}, w={best_action[1]:.2f} | Search: {search_time:.3f}s, Exec: {exec_time:.3f}s")
 

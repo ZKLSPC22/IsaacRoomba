@@ -18,7 +18,7 @@ class MCTSNode(BaseNode):
 class MCTSSolver(BaseSearcher):
     """
     Fully Observable Tabular MCTS.
-    Builds the discrete action space dynamically from configs/planners.yaml.
+    Builds the discrete action space explicitly from `mcts.actions` in configs/planners.yaml.
     """
     def __init__(self, env, config_path="configs/planners.yaml"):
         # Initialize the base class, which loads the YAML and sets shared params
@@ -33,32 +33,75 @@ class MCTSSolver(BaseSearcher):
     def _validate_config(self):
         """Validate configuration invariants before any search runs."""
         if self.num_actions <= 0:
-            raise ValueError("MCTS action grid is empty; check v_vals/omega_vals in configs/planners.yaml.")
+            raise ValueError(
+                "mcts.actions is empty in configs/planners.yaml; define at least one "
+                "[linear_velocity, angular_velocity] action."
+            )
         if self.num_actions > self.num_envs:
             raise ValueError(
                 f"num_actions ({self.num_actions}) exceeds num_envs ({self.num_envs}). "
-                "Increase num_planning_envs in configs/config.yaml or reduce the action grid."
+                "Increase num_planning_envs in configs/config.yaml or remove entries "
+                "from mcts.actions in configs/planners.yaml."
             )
         if self.num_iterations < 1:
-            raise ValueError("num_iterations must be >= 1 to produce root children.")
-        if self.max_expansions < self.num_actions:
             raise ValueError(
-                f"max_expansions ({self.max_expansions}) must be at least num_actions "
-                f"({self.num_actions}) so every root action can be expanded."
+                "num_iterations must be >= 1 to produce root children; "
+                f"got {self.num_iterations} from base.num_iterations in configs/planners.yaml."
             )
         if not (0.0 <= self.gamma <= 1.0):
-            raise ValueError(f"gamma must be in [0, 1]; got {self.gamma}.")
+            raise ValueError(
+                f"gamma must be in [0, 1]; got {self.gamma} from base.gamma in "
+                "configs/planners.yaml."
+            )
 
     def _create_action_grid(self):
-        """Constructs the discrete action grid driven strictly by YAML values."""
-        v_vals = self.mcts_cfg.get('v_vals', [0.0, 0.5, 1.0])
-        omega_vals = self.mcts_cfg.get('omega_vals', [-1.0, -0.5, 0.0, 0.5, 1.0])
-        
+        """Loads the explicit discrete action set from `mcts.actions`.
+
+        The YAML list is read directly, so list position is preserved and becomes the
+        action's index — its identity in `node.action_taken`, the run log, and the
+        `BaseSearcher.search()` tie-break. Entries must be numeric
+        `[linear_velocity, angular_velocity]` pairs inside `[-1, 1]`; anything else
+        fails fast here rather than being clamped or truncated later.
+
+        There is no fallback grid: a missing or misspelled key raises, because a
+        silent default would produce a valid-looking run with the wrong actions.
+        """
+        if 'actions' not in self.mcts_cfg:
+            raise KeyError(
+                "Missing required key 'mcts.actions' in configs/planners.yaml. "
+                "List the discrete actions explicitly as "
+                "[linear_velocity, angular_velocity] pairs in [-1, 1]."
+            )
+
+        raw_actions = self.mcts_cfg['actions']
+        if not isinstance(raw_actions, (list, tuple)):
+            raise TypeError(
+                f"mcts.actions must be a list of [linear_velocity, angular_velocity] pairs; "
+                f"got {type(raw_actions).__name__}."
+            )
+
         actions = []
-        for v in v_vals:
-            for w in omega_vals:
-                actions.append([v, w])
-        return torch.tensor(actions, dtype=torch.float32, device=self.device)
+        for index, entry in enumerate(raw_actions):
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                raise ValueError(
+                    f"mcts.actions[{index}] must be a [linear_velocity, angular_velocity] pair; "
+                    f"got {entry!r}."
+                )
+            for component in entry:
+                if isinstance(component, bool) or not isinstance(component, (int, float)):
+                    raise TypeError(
+                        f"mcts.actions[{index}] must contain numbers; got {component!r}."
+                    )
+                if not -1.0 <= float(component) <= 1.0:
+                    raise ValueError(
+                        f"mcts.actions[{index}] component {component!r} is outside [-1, 1]. "
+                        "Actions are normalized; scaling happens in generate()."
+                    )
+            actions.append([float(entry[0]), float(entry[1])])
+
+        # reshape(-1, 2) keeps the empty case a well-formed [0, 2] tensor, which
+        # _validate_config then rejects via the num_actions > 0 invariant.
+        return torch.tensor(actions, dtype=torch.float32, device=self.device).reshape(-1, 2)
 
     def _extract_physical_state(self, node):
         """For fully observable MCTS, the node's state is the exact physical state."""

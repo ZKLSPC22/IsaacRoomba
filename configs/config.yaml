@@ -1,12 +1,16 @@
 env:
-  num_rl_envs: 1
-  num_planning_envs: 16
+  num_rl_envs: 9
+  num_planning_envs: 9
   env_spacing: 2.0  # Buffer/clearance distance (metres) between adjacent room outer walls
 
 planning:
   # Number of physics ticks per generative-model macro-action.
   # At 30 Hz (dt=1/30), 15 ticks = 0.5 seconds duration.
   macro_action_ticks: 15
+
+rl:
+  max_episode_steps: 3600     # 120s at 30 Hz (replaces hard-coded 3600 in _compute_dones)
+  progress_weight: 5.0        # Multiplier for high-water-mark distance improvement
 
 task:
   # Task objective constants (single source of truth for the planning reward and
@@ -15,6 +19,7 @@ task:
   goal_reward: 10.0     # reward for reaching the goal
   collision_penalty: -5.0  # reward contribution for a bumper contact
   step_cost: -0.1       # reward contribution per macro-action
+  bumped_threshold: 0.5
 
 room:
   # Preset selector: "empty", "standard", or "custom".
