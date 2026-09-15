@@ -6,7 +6,7 @@ Status: early prototype — one planner, CUDA-only, no dependency manifest or pa
 
 **Implemented:** `core/` (simulator, room, occupancy map, visualizer) · `envs/` (`generate()`, RL env,
 pure `planning_math.py`) · `planners/` (`BaseSearcher`, `MCTSSolver`) · `scripts/` (`run_mcts.py`,
-`random_rl.py`, `debug_rl.py`) · `tracking/` (run logging).
+`debug_mcts.py`, `random_rl.py`, `debug_rl.py`) · `tracking/` (run logging).
 **Not implemented:** POMCP/POMCGS (config placeholder only, no belief representation), RL baselines and
 training code, teacher–student distillation, any planner use of observations, MCTS tree reuse,
 dependency manifest/packaging.
@@ -19,10 +19,11 @@ configs/       config.yaml, planners.yaml, experiments.yaml
 core/          room.py (Room, BoxObstacle, OccupancyMap), simulator.py, visualizer.py
 envs/          planning_env.py (G(s,a)), rl_env.py, planning_math.py
 planners/      base.py, mcts.py
-scripts/       run_mcts.py, random_rl.py, debug_rl.py
+scripts/       run_mcts.py, debug_mcts.py, random_rl.py, debug_rl.py
 tracking/      run_logger.py
 tests/         CPU-only tests (tracked; no GPU needed)
 logs/mcts/     generated run logs (git-ignored; older CSVs still tracked)
+logs/debug_mcts/  generated run logs from debug_mcts.py (same layout)
 ```
 
 ## Prerequisites
@@ -41,14 +42,29 @@ From the repository root (paths are relative); no CLI flags or environment varia
 
 ```bash
 python scripts/run_mcts.py     # MCTS demo (viewer off)
+python scripts/debug_mcts.py   # open-loop action-sequence replay (viewer off)
 python scripts/random_rl.py    # random-policy smoke test (viewer on)
 python scripts/debug_rl.py     # manual control (viewer on, needs OpenCV)
 ```
 
-`run_mcts.py` is the only implemented planner experiment: it seeds NumPy/Torch from `mcts.seed`
+`run_mcts.py` is the implemented planner experiment: it seeds NumPy/Torch from `mcts.seed`
 (`configs/experiments.yaml`), samples a collision-free start/goal pair at least
 `room.start_goal_sampling.min_distance` apart, then runs the search/execute loop. It requires
 `num_planning_envs` >= the action-grid size (shipped: 5 actions from `mcts.actions`, 9 envs).
+
+`debug_mcts.py` is the same harness with the search removed: it replays one macro-action per step
+from whichever `ACTION_MODES` entry `ACTION_MODE` selects (shipped: `turn_symmetry`, a 24-action
+turn-in-place symmetry probe; `custom` is a placeholder for ad-hoc sequences), through the same
+`env.generate()` call and the same logging chain. It writes to `logs/debug_mcts/mcts_<UTC>/` with
+`scenario.mode` naming the selected mode; the physical `steps.csv` columns are comparable with a
+`logs/mcts` run, while the search columns are zero sentinels. Each step also prints the commanded and
+achieved wheel speeds, the per-step delta-yaw and the quaternion, and the run ends with a per-phase
+turn table and a +/- omega symmetry ratio.
+
+The bumper tests the **horizontal** chassis contact force only (world X/Z): the vertical component
+carries the ground reaction and is large at rest, so including it fired on every step in open space.
+`task.heuristic_sampling` (`"bilinear"` shipped, `"nearest"` to reproduce the pre-toggle sampling)
+selects how the leaf heuristic samples the geodesic distance field.
 
 ## Config, logs, tests
 

@@ -15,3 +15,15 @@ mcts:
     output_dir: "logs/mcts"
     tensorboard: true
     render_frames: true # Generate 2D top-down PNG flipbook frames under <run_dir>/frames/
+
+debug_mcts:
+  # Random seed for NumPy/Torch (start/goal sampling and expansion order).
+  seed: 0
+
+  # Per-run logging. Each run always writes <output_dir>/<run_id>/{run.yaml,steps.csv};
+  # it additionally writes <output_dir>/<run_id>/tensorboard/ when tensorboard is true
+  # and <output_dir>/<run_id>/frames/ when render_frames is true.
+  logging:
+    output_dir: "logs/debug_mcts"
+    tensorboard: true
+    render_frames: true # Generate 2D top-down PNG flipbook frames under <run_dir>/frames/

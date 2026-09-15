@@ -97,7 +97,10 @@ class RoombaRLEnv:
         if sens_cfg['enable_bumper']:
             self.sim.gym.refresh_net_contact_force_tensor(self.sim.sim)
             forces = self.sim.contact_forces_view[:, self.sim.chassis_body_idx, :]
-            obs["bumper"] = (torch.norm(forces, dim=-1) > 0.1).float().unsqueeze(-1)
+            # Horizontal (world X/Z) only, matching
+            # `RoombaPlanningEnv._compute_bumped`: the vertical component carries
+            # the ground reaction and fires even when standing still.
+            obs["bumper"] = (torch.norm(forces[:, [0, 2]], dim=-1) > 0.1).float().unsqueeze(-1)
 
         # Visual sensors
         if sens_cfg['enable_lidar'] or sens_cfg['enable_camera']:

@@ -30,6 +30,7 @@ import yaml
 from envs.planning_math import (
     compute_planning_rewards,
     compute_straight_line_heuristic,
+    VALID_SAMPLING_MODES,
 )
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "config.yaml"
@@ -48,6 +49,11 @@ MACRO_ACTION_TICKS = 15
 DT = 1.0 / 30.0
 MACRO_ACTION_DURATION = MACRO_ACTION_TICKS * DT  # 0.5 s
 GAMMA = 0.95
+
+# The sampling mode shipped in `configs/config.yaml` under `task.heuristic_sampling`.
+# `ConfigContractTests` asserts it matches, so the tests cannot silently exercise a
+# different interpolation than the one the planner runs with.
+HEURISTIC_SAMPLING = "bilinear"
 
 
 def make_states(start_x, start_z, goal_x, goal_z):
@@ -80,6 +86,7 @@ def heuristic(states, is_terminal, gamma=GAMMA, **overrides):
         "goal_radius": GOAL_RADIUS,
         "goal_reward": GOAL_REWARD,
         "step_cost": STEP_COST,
+        "sampling_mode": HEURISTIC_SAMPLING,
     }
     kwargs.update(overrides)
     return compute_straight_line_heuristic(states, is_terminal, gamma, **kwargs)
@@ -193,6 +200,13 @@ class ConfigContractTests(unittest.TestCase):
         config = yaml.safe_load(CONFIG_PATH.read_text())
         self.assertEqual(config["robot"]["max_linear_velocity"], MAX_LINEAR_VELOCITY)
 
+    def test_shipped_heuristic_sampling_mode_is_supported(self):
+        """The configured interpolation must be one the heuristic accepts."""
+        task = yaml.safe_load(CONFIG_PATH.read_text())["task"]
+
+        self.assertEqual(task["heuristic_sampling"], HEURISTIC_SAMPLING)
+        self.assertIn(HEURISTIC_SAMPLING, VALID_SAMPLING_MODES)
+
     def test_task_constants_are_not_defined_in_planning_math(self):
         """Guard against reintroducing a second copy of the constants."""
         from envs import planning_math
@@ -227,6 +241,13 @@ class RequiredSignatureTests(unittest.TestCase):
                 max_linear_velocity=MAX_LINEAR_VELOCITY,
                 macro_action_duration=MACRO_ACTION_DURATION,
             )
+
+    def test_heuristic_rejects_an_unknown_sampling_mode(self):
+        """A typo in task.heuristic_sampling must fail, not fall back silently."""
+        states = make_states([0.0], [0.0], [1.0], [0.0])
+
+        with self.assertRaises(ValueError):
+            heuristic(states, torch.tensor([False]), sampling_mode="bicubic")
 
 
 class RewardTests(unittest.TestCase):

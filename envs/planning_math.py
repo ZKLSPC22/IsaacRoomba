@@ -39,6 +39,17 @@ import torch
 #: a numerical guard, not a task parameter, so it is not configurable.
 _GAMMA_ONE_TOLERANCE = 1e-9
 
+#: Allowed values for the heuristic's distance-field interpolation, owned by
+#: ``task.heuristic_sampling`` in `configs/config.yaml`.
+#:
+#: * ``"bilinear"`` blends the four neighbouring cells. This is the documented
+#:   contract, and it gives a smooth spatial gradient.
+#: * ``"nearest"`` quantizes to the containing cell centre. It is coarser (up to
+#:   half a cell, 0.025 m at the shipped 0.05 m resolution) and produces a
+#:   staircase in the gradient, but reproduces the sampling this heuristic used
+#:   before the mode became configurable.
+VALID_SAMPLING_MODES = ("nearest", "bilinear")
+
 # ---------------------------------------------------------------------------
 # 15D explicit state layout (see docs/ARCHITECTURE.md §6). Positions and goals are
 # room-local; quaternion `qw` is index 6. Only the fields used by the heuristic
@@ -103,6 +114,7 @@ def compute_straight_line_heuristic(
     distance_field: torch.Tensor | None = None,
     room_width: float | None = None,
     room_depth: float | None = None,
+    sampling_mode: str,
 ) -> torch.Tensor:
     """Discounted-return estimate for an ideal collision-free path to the goal.
 
@@ -131,17 +143,20 @@ def compute_straight_line_heuristic(
     Sampling
     --------
     Room-local ``x``/``z`` are normalized to the ``[-1, 1]`` cube that
-    ``grid_sample`` expects and looked up bilinearly::
+    ``grid_sample`` expects and looked up with the interpolation named by
+    ``sampling_mode``::
 
         norm_x = clamp(x / (room_width / 2), -1, 1)
         norm_z = clamp(z / (room_depth / 2), -1, 1)
         grid = stack([norm_x, norm_z], dim=-1)[None, None]        # [1, 1, batch, 2]
-        geodesic = grid_sample(distance_field, grid, mode="bilinear",
+        geodesic = grid_sample(distance_field, grid, mode=sampling_mode,
                                padding_mode="border", align_corners=True).view(-1)
 
     ``align_corners=True`` maps the normalized ``-1``/``+1`` extremes onto the
     field's first and last cell centres, and ``padding_mode="border"`` clamps
-    out-of-room poses to the border instead of returning NaN.
+    out-of-room poses to the border instead of returning NaN. ``"bilinear"`` is
+    the documented contract; ``"nearest"`` is retained so the pre-toggle sampling
+    can be reproduced exactly (see `VALID_SAMPLING_MODES`).
 
     Horizon estimation::
 
@@ -177,6 +192,11 @@ def compute_straight_line_heuristic(
             distance field in metres, with the height axis mapped to ``z``.
         room_width: Full room extent (m) along ``x``, used for normalization.
         room_depth: Full room extent (m) along ``z``, used for normalization.
+        sampling_mode: Interpolation used by ``grid_sample``, either ``"nearest"``
+            or ``"bilinear"`` (see `VALID_SAMPLING_MODES`). Owned by
+            ``task.heuristic_sampling``. Required with no default so the choice is
+            always explicit; it is unused in straight-line mode, which samples no
+            field at all.
 
     Returns:
         A float tensor of shape ``[batch]``, on the same device as ``states``.
@@ -205,6 +225,13 @@ def compute_straight_line_heuristic(
             "`room_depth`, or none of them to use the straight-line distance."
         )
 
+    if sampling_mode not in VALID_SAMPLING_MODES:
+        raise ValueError(
+            f"Invalid sampling_mode {sampling_mode!r}; expected one of "
+            f"{VALID_SAMPLING_MODES}. This is owned by task.heuristic_sampling in "
+            "configs/config.yaml."
+        )
+
     if distance_field is None:
         # Legacy mode: a clear line of sight, ignoring obstacles.
         dx = states[:, _STATE_GOAL_X_INDEX] - states[:, _STATE_X_INDEX]
@@ -222,7 +249,7 @@ def compute_straight_line_heuristic(
         sampled = torch.nn.functional.grid_sample(
             distance_field,
             grid,
-            mode="nearest",
+            mode=sampling_mode,
             padding_mode="border",
             align_corners=True,
         )

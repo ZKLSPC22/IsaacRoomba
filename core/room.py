@@ -6,7 +6,7 @@ import math
 
 import numpy as np
 from isaacgym import gymapi
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, distance_transform_edt
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
@@ -249,10 +249,19 @@ class OccupancyMap:
 
         A goal inside the inflated obstacle margin is snapped to the nearest
         free cell (the field then measures distance to that cell, because the
-        graph contains no node for an occupied cell). Cells that are occupied
-        or unreachable from the goal are assigned ``max_finite + 2.0`` so the
-        field is finite and finite-differencing or interpolation over it never
-        produces NaN or inf.
+        graph contains no node for an occupied cell).
+
+        Cells with no node in the graph -- the inflated obstacle margin and the
+        boundary walls -- are filled with the distance of their **nearest free
+        cell**, via a Euclidean distance transform. Using a single large
+        sentinel value there instead made the field discontinuous: the whole
+        margin (35% of a 5x5 m room at the shipped resolution) read as farther
+        away than the most distant reachable cell, so a planner minimizing
+        distance was actively pushed against the margin it was supposed to avoid.
+        Inheriting the neighbouring value keeps the field monotone across the
+        margin, so the estimate degrades gracefully instead of inverting.
+        Free-but-unreachable cells (a disconnected pocket) are filled the same
+        way, from the nearest free cell that the goal can actually reach.
         """
         half_width = self.width_cells * self.res / 2.0
         half_depth = self.depth_cells * self.res / 2.0
@@ -274,12 +283,18 @@ class OccupancyMap:
             self.width_cells, self.depth_cells
         )
 
-        reachable = np.isfinite(dist_2d)
-        max_val = float(np.max(dist_2d[reachable])) if np.any(reachable) else 0.0
-        fallback = np.float64(max_val + 2.0)
+            # Cells that carry a real graph distance: free space the goal can reach.
+        source = (self.c_space_grid == 0) & np.isfinite(dist_2d)
+        if not np.any(source):
+            # Degenerate room (no free cell reaches the goal): a zero field is
+            # finite and keeps every downstream consumer NaN-free.
+            return np.zeros_like(dist_2d, dtype=np.float32)
 
-        free_and_reachable = reachable & (self.c_space_grid == 0)
-        dist_2d = np.where(free_and_reachable, dist_2d, fallback)
+        # For every other cell, `nearest` holds the indices of the closest
+        # `source` cell; free source cells map to themselves, so this is a no-op
+        # for them and only rewrites the margin, the walls, and any pocket.
+        _, nearest = distance_transform_edt(~source, return_indices=True)
+        dist_2d = dist_2d[nearest[0], nearest[1]]
 
         return dist_2d.astype(np.float32)
     

@@ -38,6 +38,8 @@ class RoombaPlanningEnv:
         self.collision_penalty = task_cfg['collision_penalty']
         self.step_cost = task_cfg['step_cost']
         self.bumped_threshold = task_cfg['bumped_threshold']
+        self.wheels_reset = task_cfg['wheels_reset']
+        self.heuristic_sampling = task_cfg['heuristic_sampling']
 
         # 2. Setup indices and internal variables
         self.all_env_ids = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
@@ -102,8 +104,9 @@ class RoombaPlanningEnv:
         # Force the physics engine to teleport the actors
         self.sim.set_actor_root_states(self.sim.root_states, actor_ids)
 
-        # Reset wheel DOF state so G(s, a) is Markov in the 15D state
-        self.sim.reset_dof_states()
+        if self.wheels_reset:
+            # Reset wheel DOF state so G(s, a) is Markov in the 15D state
+            self.sim.reset_dof_states()
         
         # Step graphics so visual sensors (camera/lidar) update to the teleported positions
         self.sim.sync_graphics()
@@ -111,12 +114,29 @@ class RoombaPlanningEnv:
     def _compute_bumped(self):
         """Refresh contact forces and return a per-env bump boolean mask.
 
-        Decoupled from the observation dict so rewards can be computed even when
-        observations are skipped.
+        Only the *horizontal* force components (world X and Z) are tested. The
+        chassis rests on the ground, so the vertical component (world Y) carries
+        the ground reaction and the landing impulse from the spawn-height drop;
+        it is large even when the robot is standing still in open space, which
+        made the mask fire on every macro-action regardless of collisions.
+
+        Measured on the shipped room (5x5, robot r=0.17 m), per macro-action:
+
+        * free space, `[0, 0]`/spin/straight drive: ``|f_horizontal|`` = 0.000 N
+          (567 free-space samples across 81 poses and 7 actions, peak 2e-6 N),
+          while ``|f_vertical|`` reaches 14.8 N;
+        * driving into a wall: 12.5-19.0 N.
+
+        The vertical spikes are therefore entirely responsible for the resting
+        false positives, and ``bumped_threshold`` keeps its shipped value of
+        2.0 N: roughly six orders of magnitude above the horizontal noise floor
+        and about 6x below the weakest measured real contact.
         """
         self.sim.gym.refresh_net_contact_force_tensor(self.sim.sim)
         forces = self.sim.contact_forces_view[:, self.sim.chassis_body_idx, :]
-        return torch.norm(forces, dim=-1) > self.bumped_threshold
+        # Indices 0 and 2 are world X and Z; index 1 is world Y (up).
+        horizontal = torch.norm(forces[:, [0, 2]], dim=-1)
+        return horizontal > self.bumped_threshold
 
     def _compute_rewards(self, dist_to_goal, bumped):
         """Batched planning reward; binds task config to `envs.planning_math`.
@@ -202,6 +222,7 @@ class RoombaPlanningEnv:
             distance_field=distance_field,
             room_width=self.sim.room.width,
             room_depth=self.sim.room.depth,
+            sampling_mode=self.heuristic_sampling,
         )
 
     def _compute_observations(self, bumped=None):

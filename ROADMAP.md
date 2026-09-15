@@ -1002,6 +1002,17 @@ Characterize the relationship between planning budget (`num_iterations`) and nav
   * **Latency:** Search time per decision (sec) and execution throughput (decisions/sec).
   * **Tree Characteristics:** Tree size (total nodes generated) and maximum tree depth reached.
   * **Simulation Overhead:** Expansion calls (`generate()` calls) and total PhysX simulator ticks.
+
+## In-flight fixes (2026-09-15)
+
+Correctness work on the released baseline, in this order: (1) bumper sensor false positives, (2) the
+inflated-cell sentinel in the geodesic field, (3) a configurable `grid_sample` interpolation mode.
+All 2026-09-15 planner runs before these fixes terminate `no_progress` with the robot ~2.75 m from the
+goal.
+
+* **Last run logged before the bumper physics change:** `logs/mcts/mcts_20260915_140224`
+  (started `2026-09-15T14:02:24Z`). Last `logs/debug_mcts` run before it: `mcts_20260915_131226`.
+  Logs from this point on are not comparable with earlier ones on the collision term.
 ## Later milestones
 
 - **M2 — Search efficiency and budgets [later]**: retain and re-root the tree across control steps,

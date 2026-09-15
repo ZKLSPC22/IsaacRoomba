@@ -19,7 +19,19 @@ task:
   goal_reward: 10.0     # reward for reaching the goal
   collision_penalty: -5.0  # reward contribution for a bumper contact
   step_cost: -0.1       # reward contribution per macro-action
-  bumped_threshold: 0.5
+  # Bumper sensitivity in newtons, tested against the HORIZONTAL contact force only
+  # (world X/Z). The vertical component carries the ground reaction and is large at
+  # rest, so including it fired the bumper on every step in free space. Measured
+  # free-space horizontal peak 2e-6 N vs 12.5-19.0 N for a real wall contact.
+  bumped_threshold: 2.0
+  wheels_reset: True
+
+  # Interpolation used when the leaf heuristic samples the geodesic distance
+  # field. "bilinear" blends the four neighbouring cells (the documented contract,
+  # and a smooth gradient); "nearest" quantizes to the containing cell centre, up
+  # to half a cell (0.025 m) coarser, with a staircase gradient, but it reproduces
+  # the sampling used before this became configurable.
+  heuristic_sampling: "bilinear"
 
 room:
   # Preset selector: "empty", "standard", or "custom".

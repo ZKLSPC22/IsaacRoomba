@@ -88,10 +88,20 @@ rather than being dropped. `compute_observation=False` skips observation constru
 = one `run_mcts.py` control step. `RoombaRLEnv.step` advances one tick (1/30 s). The code default is 30
 ticks when `planning` is absent; the shipped config sets 15.
 
-**Sensors** (`spaces.Dict`, per the `sensors` toggles): bumper `(1,)` (chassis contact-force norm >
-0.1, OR-ed over the macro-action), lidar `(64,)` (1D depth camera, 120° FOV, radial distance,
-flipped), camera `(64, 64, 3)` (RGB facing +X). Shipped: bumper only, graphics off
-(`graphics_device = -1`); no planner consumes observations.
+**Sensors** (`spaces.Dict`, per the `sensors` toggles): bumper `(1,)` (**horizontal** chassis
+contact-force norm > `task.bumped_threshold`, OR-ed over the macro-action), lidar `(64,)` (1D depth
+camera, 120° FOV, radial distance, flipped), camera `(64, 64, 3)` (RGB facing +X). Shipped: bumper only,
+graphics off (`graphics_device = -1`); no planner consumes observations.
+
+The bumper tests **world X and Z only**; the vertical component is discarded. The chassis rests on the
+ground, so `f_y` carries the ground reaction and the landing impulse from the spawn-height drop: measured
+at the shipped spawn in open space it reaches 14.8 N while standing still, i.e. it exceeded every
+practical threshold and fired the bumper on essentially every macro-action regardless of collisions
+(recorded as a constant `-5.1` reward per step). Isolating the horizontal components leaves a
+free-space noise floor of 2e-6 N (567 samples over 81 free poses x 7 actions) against 12.5-19.0 N for a
+genuine wall contact, so the shipped threshold of 2.0 N sits about six orders of magnitude above the
+noise and 6x below the weakest measured contact. Note this is a *velocity-dependent* contact force: a
+robot resting against a wall without pushing reads zero.
 
 **Batching:** `physx.use_gpu` and `use_gpu_pipeline` are always on, and all interaction is batched
 across `num_envs` on `env.device` with no per-env Python loops in the planner hot path. `_expand`
@@ -120,23 +130,41 @@ are free, which prevents cutting corners through inflated obstacle cells.
 `OccupancyMap.compute_distance_field(goal_x, goal_z)` maps the goal to its cell (clamped), snaps to the
 nearest free cell when the goal sits inside an inflated margin, runs
 `scipy.sparse.csgraph.dijkstra(directed=False)`, and reshapes to a room-local
-`(width_cells, depth_cells)` float32 array of path lengths **in metres**. Cells that are occupied or
-unreachable from the goal are set to `max_finite + 2.0`, so the field is finite everywhere — that value
-is a finite upper bound, not a distance.
+`(width_cells, depth_cells)` float32 array of path lengths **in metres**.
+
+Cells with no graph node — the inflated obstacle margin and the boundary walls — are filled with the
+distance of their **nearest free-and-reachable cell**, computed with a Euclidean distance transform
+(`scipy.ndimage.distance_transform_edt(..., return_indices=True)`). Inheriting the neighbour's value keeps
+the field continuous across the margin. Assigning a single large sentinel there instead (`max_finite +
+2.0`, the previous behaviour) made the field *discontinuous and misleading*: in the shipped 5x5 m room the
+margin covers 3540 of 10000 cells (35%), and every one of them read farther than the most distant
+reachable cell (7.67 m vs a true maximum of 5.67 m). Since the heuristic is monotonically decreasing in
+sampled distance, that inversion scored goal-ward motion into the margin as the worst value in the room —
+measured along a goal-ward line from the shipped spawn, the value collapsed from 6.466 to 1.675 in 0.15 m
+while the Euclidean equivalent rose 6.523 -> 6.745. With the fill, the same probe rises monotonically
+(0 of 59 consecutive samples decrease).
 
 `RoombaPlanningEnv._get_or_update_distance_field(goal_x, goal_z)` owns the GPU cache: the field depends
 only on the goal (the room layout is static), so it is computed once per distinct goal — within `1e-4` —
 and stored transposed as a `[1, 1, depth_cells, width_cells]` float32 tensor on `env.device`, with the
 tensor height axis mapped to Z/depth and the width axis to X/width. `compute_heuristic_values` reads the
 goal from `states[0, 13:15]` (valid because `_expand` replicates one parent state across the batch, so
-the batch shares one goal) and samples the field bilinearly:
+the batch shares one goal) and samples the field with the interpolation named by
+`task.heuristic_sampling`:
 
 ```
 norm_x = clamp(x / (room_width / 2), -1, 1);  norm_z = clamp(z / (room_depth / 2), -1, 1)
 grid   = stack([norm_x, norm_z], dim=-1)[None, None]         # [1, 1, batch, 2]
-dist_geodesic = grid_sample(field, grid, mode="bilinear",
+dist_geodesic = grid_sample(field, grid, mode=task.heuristic_sampling,
                             padding_mode="border", align_corners=True).view(-1)
 ```
+
+`task.heuristic_sampling` is a required parameter with no default (`planning_math` keeps no fallbacks);
+an unknown value raises `ValueError` naming the key. `"bilinear"` (shipped) blends the four neighbouring
+cells and is the documented contract; `"nearest"` quantizes to the containing cell centre — up to half a
+cell, 0.025 m at the shipped 0.05 m resolution — and is retained only to reproduce the pre-toggle
+sampling exactly. `tests/test_planning_math.py::sample_geodesic_field` is the independent NumPy reference
+for the bilinear convention and `ConfigContractTests` pins the shipped value.
 
 `align_corners=True` maps normalized `-1`/`+1` onto the first/last **cell centres**, so the outer half
 cell of each axis is reachable only by the `clamp`/`border` behaviour; that boundary approximation is the
@@ -193,9 +221,12 @@ rl:        progress = max(min_dist - dist, 0); min_dist = min(min_dist, dist)   
            done     = reached | (progress_buf >= rl.max_episode_steps)
 ```
 
-`bumped` is the OR-accumulated bumper mask (all-`False` when disabled) and the planning step cost is
-unconditional, including on the terminal step; planning episodes are bounded by `run_mcts.py`
-(`max_execution_steps` plus no-progress detection). In RL, `min_dist_to_goal` starts at the reset-time
+`bumped` is the OR-accumulated bumper mask (all-`False` when disabled), built from the horizontal-only
+contact force described in §3, and the planning step cost is unconditional, including on the terminal
+step; planning episodes are bounded by `run_mcts.py` (`max_execution_steps` plus no-progress detection).
+Because the bumper fired on nearly every step before the vertical component was discarded, `bumped` was
+effectively always true, which made `collision_penalty` a constant offset that discarded the step's only
+progress signal. In RL, `min_dist_to_goal` starts at the reset-time
 start→goal distance (so a round trip pays nothing extra), `_compute_rewards` ignores its `actions`
 argument, and `step()` resets finished envs inline at one tick per step. The two environments share
 robot, room, and simulator but have independent rewards, termination, and control rates.
