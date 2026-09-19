@@ -3,6 +3,12 @@ env:
   num_planning_envs: 9
   env_spacing: 2.0  # Buffer/clearance distance (metres) between adjacent room outer walls
 
+simulation:
+  # PhysX solver iterations per physics tick. Defaults are 4 position / 1 velocity;
+  # the asymmetric-turn debug runs use a stiffer solve.
+  num_position_iterations: 16
+  num_velocity_iterations: 8
+
 planning:
   # Number of physics ticks per generative-model macro-action.
   # At 30 Hz (dt=1/30), 15 ticks = 0.5 seconds duration.

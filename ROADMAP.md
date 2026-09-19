@@ -16,8 +16,12 @@ Clean-up and debug MCTS, run experiments to verify robustness of code, debug, th
 
 ### Open Tasks:
 
-- [ ] Suspect assymetry between clockwise rotation and anti-clockwise rotation, see /logs/debug_mcts/mcts_20260915_131226/steps.csv
+- [ ] Suspect asymmetry between clockwise rotation and anti-clockwise rotation, see /logs/debug_mcts/mcts_20260915_131226/steps.csv
 
+  - [x] Root cause diagnosed: caster friction was never disabled. Casters now load frictionless
+    (`core/simulator.py`, `docs/ARCHITECTURE.md` §2); residual asymmetry is unexplained.
+
+  - [X] Problem remains, now suspect insufficient velocity and position PhysX iteration, increase num_position_iterations 4 -> 16, num_velocity_iterations 1 -> 8. Add config['simulation'], add num_position_iterations and num_velocity_iterations to config['simulation'], inheritted by simulator.py.
 
 - [ ] Tests should be changed to fit the new version, and ensure the new bumper physics and Hijkstra Heuristic.
 

@@ -10,6 +10,10 @@ import torch
 
 
 class RoombaSimulator:
+    # Links `roomba.urdf` declares as frictionless caster spheres. Isaac Gym ignores
+    # URDF friction, so their PhysX contacts must be zeroed explicitly here.
+    CASTER_LINKS = ("front_caster", "rear_caster")
+
     def __init__(self, num_envs, config_path="configs/config.yaml", sim_device="cuda:0", show_viewer=True):
         # 1. load config
         with open(config_path, 'r') as f:
@@ -88,6 +92,10 @@ class RoombaSimulator:
         sim_params.dt = 1.0 / 30.0  # Force physics engine to 30 Hz
         self.dt = sim_params.dt
         sim_params.physx.use_gpu = True
+        # Required keys, direct-indexed so a missing/typo'd `simulation:` section
+        # fails fast instead of silently reverting to the PhysX defaults (4/1).
+        sim_params.physx.num_position_iterations = self.config["simulation"]["num_position_iterations"]
+        sim_params.physx.num_velocity_iterations = self.config["simulation"]["num_velocity_iterations"]
         sim_params.use_gpu_pipeline = True
         sim_params.up_axis = gymapi.UP_AXIS_Y
         sim_params.gravity = gymapi.Vec3(0.0, -9.81, 0.0)
@@ -108,6 +116,21 @@ class RoombaSimulator:
             )
             if asset is None:
                 raise RuntimeError("Failed to load 'roomba.urdf'. Check file path and URDF syntax.")
+
+            # Casters must slide, not stick: stale contact friction makes the
+            # achieved wheel speeds direction-dependent (see the rotation asymmetry
+            # in /logs/debug_mcts). Zero all three friction coefficients on them.
+            shape_props = self.gym.get_asset_rigid_shape_properties(asset)
+            body_names = self.gym.get_asset_rigid_body_names(asset)
+            body_shape_ranges = self.gym.get_asset_rigid_body_shape_indices(asset)
+            for name, index_range in zip(body_names, body_shape_ranges):
+                if name not in self.CASTER_LINKS:
+                    continue
+                for shape_idx in range(index_range.start, index_range.start + index_range.count):
+                    shape_props[shape_idx].friction = 0.0
+                    shape_props[shape_idx].rolling_friction = 0.0
+                    shape_props[shape_idx].torsion_friction = 0.0
+            self.gym.set_asset_rigid_shape_properties(asset, shape_props)
             return asset
     
     def _load_room_layout(self) -> Room:

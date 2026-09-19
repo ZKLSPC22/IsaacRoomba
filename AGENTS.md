@@ -34,11 +34,12 @@ existing).
 
 ## Config
 
-- Owners: `configs/config.yaml` (env/room/task/sensors/robot), `configs/planners.yaml`,
+- Owners: `configs/config.yaml` (env/simulation/room/task/sensors/robot), `configs/planners.yaml`,
   `configs/experiments.yaml`. No hard-coded tunables where an owner exists; no duplicated or dead keys.
 - Required keys are direct-indexed (fail fast): `room.occupancy_map.*`,
-  `room.start_goal_sampling.min_distance`, `task.{goal_radius,goal_reward,collision_penalty,step_cost}`.
-  No silent fallbacks; no task constants in `envs/planning_math.py`.
+  `room.start_goal_sampling.min_distance`, `task.{goal_radius,goal_reward,collision_penalty,step_cost}`,
+  `simulation.{num_position_iterations,num_velocity_iterations}`. No silent fallbacks; no task
+  constants in `envs/planning_math.py`.
 
 ## Verification and writing
 

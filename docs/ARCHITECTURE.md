@@ -68,6 +68,13 @@ The negation encodes this URDF's wheel spin-axis convention. Targets go into a
 `[num_envs, dofs_per_actor]` view via `set_dof_velocity_target_tensor` (wheel DOFs `DOF_MODE_VEL`,
 stiffness 0.0, damping 1000.0).
 
+**Contacts:** `_load_robot_asset()` zeroes the `friction`, `rolling_friction` and `torsion_friction` of
+the `front_caster`/`rear_caster` collision shapes (`RoombaSimulator.CASTER_LINKS`), located through
+`get_asset_rigid_body_shape_indices()`. Isaac Gym ignores the URDF's `<contact_coefficients>`, so
+without this every shape inherits the PhysX default (mu = 1) and the fixed casters stick instead of
+sliding, which makes achieved wheel speeds direction-dependent (chassis and drive wheels keep the
+default).
+
 ## 3. Generative model, timing, sensors, batching
 
 `env.generate(states, actions, compute_observation=True)` -> `(next_states, obs, rewards, dones)`:
@@ -110,6 +117,11 @@ rows of a zero `[num_envs, 2]` tensor — **padded slots still advance physics**
 `num_envs - num_actions`; shipped 5 actions over 9 envs, so 4 padding slots advance physics). The
 occupancy map and its Dijkstra distance field are the sanctioned CPU exceptions, and the field is
 recomputed only when the goal changes (once per distinct goal, never per leaf).
+
+**Solver:** `_setup_simulator()` sets `physx.num_position_iterations` / `num_velocity_iterations` from
+`simulation:` in `configs/config.yaml` (direct-indexed, so a missing key raises). Both flags also feed
+the joint-drive solve, so raising them stiffens the wheel-velocity tracking that the differential-drive
+model assumes; the shipped 16/8 sit above the PhysX defaults of 4/1.
 
 ## 4. Heuristic and MCTS
 
