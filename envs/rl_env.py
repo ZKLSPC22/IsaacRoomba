@@ -6,6 +6,7 @@ from isaacgym import gymapi, gymtorch
 import torch
 
 from core.simulator import RoombaSimulator
+from envs.planning_math import compute_bumped
 
 
 class RoombaRLEnv:
@@ -27,6 +28,9 @@ class RoombaRLEnv:
         self.goal_reward = task_cfg['goal_reward']
         self.collision_penalty = task_cfg['collision_penalty']
         self.step_cost = task_cfg['step_cost']
+        # Shared with RoombaPlanningEnv so both environments agree on what counts
+        # as a bump.
+        self.bumped_threshold = task_cfg['bumped_threshold']
 
         # 2. Setup RL-specific variables
         self.all_env_ids = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
@@ -75,8 +79,13 @@ class RoombaRLEnv:
         # High-water mark progress calculation
         progress = torch.clamp(self.min_dist_to_goal - dist_to_goal, min=0.0)
         self.min_dist_to_goal = torch.minimum(self.min_dist_to_goal, dist_to_goal)
-        
-        rewards = (progress * self.config['rl']['progress_weight']) + (reached.float() * 10.0) + (bumped.float() * self.collision_penalty)
+
+        # Goal and collision terms come from `task.*`, like the planning reward.
+        rewards = (
+            (progress * self.config['rl']['progress_weight'])
+            + (reached.float() * self.goal_reward)
+            + (bumped.float() * self.collision_penalty)
+        )
         return rewards
 
     def _compute_dones(self, dist_to_goal):
@@ -97,10 +106,8 @@ class RoombaRLEnv:
         if sens_cfg['enable_bumper']:
             self.sim.gym.refresh_net_contact_force_tensor(self.sim.sim)
             forces = self.sim.contact_forces_view[:, self.sim.chassis_body_idx, :]
-            # Horizontal (world X/Z) only, matching
-            # `RoombaPlanningEnv._compute_bumped`: the vertical component carries
-            # the ground reaction and fires even when standing still.
-            obs["bumper"] = (torch.norm(forces[:, [0, 2]], dim=-1) > 0.1).float().unsqueeze(-1)
+            bumped = compute_bumped(forces, threshold=self.bumped_threshold)
+            obs["bumper"] = bumped.float().unsqueeze(-1)
 
         # Visual sensors
         if sens_cfg['enable_lidar'] or sens_cfg['enable_camera']:

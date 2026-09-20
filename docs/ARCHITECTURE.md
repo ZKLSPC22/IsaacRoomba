@@ -2,7 +2,10 @@
 
 Runtime behavior wins over source comments. Related:
 [`../README.md`](../README.md) (how to run), [`../ROADMAP.md`](../ROADMAP.md) (planned work),
-[`../AGENTS.md`](../AGENTS.md) (agent rules, condensed invariants).
+[`../AGENTS.md`](../AGENTS.md) (agent rules, condensed invariants). This file is the only
+project-authored doc in `docs/`: `SimulationSetup.md` and `TensorAPI.md` are verbatim copies of the
+Isaac Gym documentation (a third-party mirror) describing the generic API, not this repository, and they
+are not edited here; `COMPLETED_TASKS.md` is finished-work history, not current behavior.
 
 ## 1. Layers and flow
 
@@ -44,8 +47,11 @@ is `envs_per_row = int(sqrt(num_envs))` — 3x3 for the shipped 9.
 
 **Frames:** `UP_AXIS_Y`, gravity `(0, -9.81, 0)` — Y up, the robot drives in X–Z, +X forward (front
 marker x = 0.175), +Z right (chassis cylinder r = 0.17, wheels r = 0.036 at z = ±0.1175, a 0.235 m
-baseline = `L`). World positions are raw `root_states`; **room-local** subtracts `sim.env_origins`
-(`get_states` subtracts indices 0–2, `set_states` adds them back, velocity indices untouched).
+baseline = `L`). Positions and goals in the 15D state are **room-local**, and the env tensors hold
+room-local values directly: `get_states` returns `root_states[robot_actor_indices]` unshifted and
+`set_states` writes `states[:, :13]` back into the same rows, so no origin offset is applied in either
+direction. Each `create_env` grid slot is still a distinct world position — the per-env offset is the
+Isaac Gym environment origin, which is why every env index maps 1:1 onto its own slot.
 `sample_valid_pose()` returns room-local coordinates.
 
 **State** (`Box(shape=(15,))`, float32 on `env.device`): 0–2 `x,y,z` (room-local metres, `y` rests at
@@ -78,17 +84,20 @@ default).
 ## 3. Generative model, timing, sensors, batching
 
 `env.generate(states, actions, compute_observation=True)` -> `(next_states, obs, rewards, dones)`:
-(1) `set_states` splits `states[:, :13]`/`states[:, 13:15]`, adds `env_origins` to indices 0–2, writes
-with `set_actor_root_state_tensor_indexed` (**a teleport**), then `reset_dof_states()` and
-`sync_graphics()`; (2) clamp/scale actions and apply wheel velocities; (3) step physics
-`macro_action_ticks` times, OR-ing bumper contacts; (4) refresh the root state and set
+(1) `set_states` splits `states[:, :13]`/`states[:, 13:15]`, writes indices 0–2 and the rest of the root
+state into `root_states[robot_actor_indices]` in room-local coordinates, and commits them with
+`set_actor_root_state_tensor_indexed` (**a teleport**), then `reset_dof_states()` (only when
+`task.wheels_reset` is true) and `sync_graphics()`; (2) clamp/scale actions and apply wheel velocities;
+(3) step physics `macro_action_ticks` times, OR-ing bumper contacts; (4) refresh the root state and set
 `dones = room_local_dist < goal_radius`; (5) return `get_states()`, `_compute_rewards(...)`,
 optionally observations, and draw debug visuals.
 
-**Markov requirement:** wheel DOF positions/velocities are not in the 15D state, so
-`reset_dof_states()` must keep running — otherwise the same `(s, a)` yields different successors
-depending on what the slot previously ran — and robots must spawn at resting height (`y = 0.065`)
-rather than being dropped. `compute_observation=False` skips observation construction. The batch is a
+**Markov requirement:** wheel DOF positions/velocities are not in the 15D state, so with
+`task.wheels_reset: true` (shipped) `reset_dof_states()` must keep running — otherwise the same `(s, a)`
+yields different successors depending on what the slot previously ran. Turning it off makes the
+transition history-dependent; it is an experimental toggle, not an equivalent choice. Robots must also
+spawn at resting height (`y = 0.065`) rather than being dropped.
+`compute_observation=False` skips observation construction. The batch is a
 **fixed size** (`env.num_planning_envs`): every call must supply exactly that many rows.
 
 **Timing:** physics 30 Hz (`dt = 1/30`); `planning.macro_action_ticks: 15`, so one `generate()` = 0.5 s
@@ -108,7 +117,10 @@ practical threshold and fired the bumper on essentially every macro-action regar
 free-space noise floor of 2e-6 N (567 samples over 81 free poses x 7 actions) against 12.5-19.0 N for a
 genuine wall contact, so the shipped threshold of 2.0 N sits about six orders of magnitude above the
 noise and 6x below the weakest measured contact. Note this is a *velocity-dependent* contact force: a
-robot resting against a wall without pushing reads zero.
+robot resting against a wall without pushing reads zero. The test itself lives in
+`envs/planning_math.py::compute_bumped`, so `RoombaRLEnv` and `RoombaPlanningEnv` cannot drift apart;
+both pass `task.bumped_threshold` (the RL env previously hard-coded 0.1 N, making it 20x more sensitive
+than the calibrated value below).
 
 **Batching:** `physx.use_gpu` and `use_gpu_pipeline` are always on, and all interaction is batched
 across `num_envs` on `env.device` with no per-env Python loops in the planner hot path. `_expand`
@@ -194,11 +206,13 @@ rollout: a value estimate, not reward shaping (PBRS would need an added
 $\gamma\,\Phi(s') - \Phi(s)$ reward term, which does not exist). It accounts for obstacle detours through
 the path length but still ignores collision **risk**, and shares `goal_radius` with the terminal check.
 Omitting `distance_field`, `room_width` and `room_depth` together falls back to the earlier
-`sqrt(dx^2 + dz^2)` straight-line distance (the function keeps its old name); no caller in the repository
-uses that path.
+`sqrt(dx^2 + dz^2)` straight-line distance (the function keeps its old name); no production caller uses
+that path, only `tests/test_planning_math.py`.
 
 **Parameters** (`configs/planners.yaml` `base.*`): `c_param` 1.414 (UCB1
-`Q/N + c_param*sqrt(ln(parent.N)/N)`, unvisited `+inf`), `num_iterations` 100, `gamma` 0.95.
+`Q/N + c_param*sqrt(ln(parent.N)/N)`, unvisited `+inf`), `gamma` 0.95. The search budget
+`base.num_iterations` is the tunable one and changes per experiment; read the shipped value from the
+config rather than from this document.
 `mcts.actions` is the explicit, ordered action set the solver loads directly — shipped 5
 `[linear_velocity, angular_velocity]` pairs (`[1.0, 0.0]`, `[1.0, 1.0]`, `[1.0, -1.0]`, `[0.0, 1.0]`,
 `[0.0, -1.0]`), with no stationary action. Index order is the action's identity in
@@ -229,7 +243,8 @@ planning:  reached = dist < goal_radius
            reward  = reached*goal_reward + bumped*collision_penalty + step_cost   # +10 / -5 / -0.1
            done    = reached                                    # no timeout in the env
 rl:        progress = max(min_dist - dist, 0); min_dist = min(min_dist, dist)    # high-water mark
-           reward   = progress*rl.progress_weight + reached*10.0 - bumped*task.collision_penalty
+           reward   = progress*rl.progress_weight + reached*task.goal_reward
+                      + bumped*task.collision_penalty   # collision_penalty is already negative
            done     = reached | (progress_buf >= rl.max_episode_steps)
 ```
 
@@ -247,9 +262,9 @@ robot, room, and simulator but have independent rewards, termination, and contro
 
 | File | Owns |
 | --- | --- |
-| `configs/config.yaml` | `env.num_rl_envs` (9), `env.num_planning_envs` (9), `env.env_spacing` (2.0 m grid buffer), `planning.macro_action_ticks`, `rl.max_episode_steps`, `rl.progress_weight`, `room.*`, `task.*`, `sensors.*`, `robot.*` |
+| `configs/config.yaml` | `env.num_rl_envs` (9), `env.num_planning_envs` (9), `env.env_spacing` (2.0 m grid buffer), `simulation.{num_position_iterations,num_velocity_iterations}`, `planning.macro_action_ticks`, `rl.max_episode_steps`, `rl.progress_weight`, `room.*`, `task.*`, `sensors.*`, `robot.*` |
 | `configs/planners.yaml` | `base.*`, `mcts.actions` and `mcts.*`, unused `pomcgs.*` |
-| `configs/experiments.yaml` | `mcts.seed`, `mcts.max_execution_steps`, `mcts.no_progress.*`, `mcts.logging.*` |
+| `configs/experiments.yaml` | `mcts.seed`, `mcts.max_execution_steps`, `mcts.no_progress.*`, `mcts.logging.*`, and the parallel `debug_mcts.*` section for `debug_mcts.py` |
 
 `mcts.logging` holds `output_dir`, `tensorboard`, and `render_frames`: the last is the on/off switch for
 the PNG flipbook, read by `scripts/run_mcts.py` as `bool(logging_cfg.get("render_frames", False))` and
@@ -309,23 +324,23 @@ CSVs logged before the pose columns existed cannot be replayed.
 
 ## 7. Invariants and known limitations
 
-Invariants (condensed in [`../AGENTS.md`](../AGENTS.md); keep both in sync): keep the 15D layout and the
-`get_states`/`set_states` origin symmetry; keep actions normalized `[-1, 1]²`; keep the Y-up,
-X-forward, Z-right frame; planners reach the world only through `generate()` and
-`compute_heuristic_values`; rewards and termination stay in `envs/`; hot paths stay GPU-batched;
-teleports keep resetting wheel DOF state and place robots at resting height;
-`num_actions <= num_planning_envs`; macro-action duration is `macro_action_ticks * (1/30)` s and is
+Invariants (condensed in [`../AGENTS.md`](../AGENTS.md); keep both in sync): keep the 15D layout
+untouched, with room-local positions and goals in both directions of `get_states`/`set_states`; keep
+actions normalized `[-1, 1]²`; keep the Y-up, X-forward, Z-right frame; planners reach the world only
+through `generate()` and `compute_heuristic_values`; rewards and termination stay in `envs/`; hot paths
+stay GPU-batched; with `task.wheels_reset: true` teleports keep resetting wheel DOF state, and robots
+stay at resting height; `num_actions <= num_planning_envs`; macro-action duration is
+`macro_action_ticks * (1/30)` s and is
 shared with the heuristic; the cached distance field is built for one goal and normalized by the room
 extents, so the field, `states[:, 13:15]`, and `sim.room` must always describe the same goal and room;
-`STEP_COLUMNS` is one schema with three consumers, so changing it means changing `run_logger.py`,
-`scripts/run_mcts.py`, and `tests/test_run_logger.py` together, and frames stay derived (never
-authoritative) so a rendering failure cannot change or truncate a logged record.
+`STEP_COLUMNS` is one schema with four consumers, so changing it means changing `run_logger.py`,
+`scripts/run_mcts.py`, `scripts/debug_mcts.py`, and `tests/test_run_logger.py` together, and frames stay
+derived (never authoritative) so a rendering failure cannot change or truncate a logged record.
 
 Limitations: no tree reuse; count-based budgets only; fully observable only; padded slots waste
 physics (`num_envs - num_actions`); matplotlib is an undeclared import-time dependency of `tracking/`
 even when `render_frames` is false, and every `steps.csv` written before the pose columns existed is
-unreplayable; `RoombaRLEnv` reads `task.goal_radius` and `rl.*`, but its goal term still hard-codes
-`10.0` instead of `task.goal_reward`; `pomcgs.*` is configured
+unreplayable; `pomcgs.*` is configured
 but never read; `_extract_physical_state` is never called; mixed configuration strictness; CPU
 occupancy-map serialization plus one CPU Dijkstra per distinct goal; an extra GPU sync per transition; dead viewer-close checks in the RL
 scripts (`step()` never returns `False`); `tests/` is tracked and CPU-only.

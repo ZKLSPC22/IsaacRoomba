@@ -8,8 +8,11 @@ not importable (see `_isaacgym_available` / `_register_isaacgym_stub`).
 Contract under test: `OccupancyMap.compute_distance_field(goal_x, goal_z)`
 returns a room-local `np.ndarray` of shape `[width_cells, depth_cells]` (index 0
 spans +X, index 1 spans +Z) holding the shortest obstacle-aware path distance in
-metres from every cell to the goal, and finite everywhere, including inflated
-obstacle margins and the boundary walls.
+metres from every cell to the goal, and finite everywhere.
+
+Cells with no node in the free-space graph -- the inflated obstacle margin, the
+boundary walls, and any pocket the goal cannot reach -- inherit the distance of
+their nearest reachable free cell (see `TestCellsWithoutGraphNodes`).
 
 These tests are deliberately one-cell tolerant: the cell lookup convention
 (`int` truncation vs. nearest-cell rounding) is an implementation detail, and one
@@ -91,6 +94,18 @@ def grid_index(occ_map: OccupancyMap, x: float, z: float):
         int(round((x + half_width) / occ_map.res)),
         int(round((z + half_depth) / occ_map.res)),
     )
+
+
+def nearest_free_cell_distance(occ_map: OccupancyMap, dist_field, gx: int, gz: int) -> float:
+    """Distance of the free cell closest to `(gx, gz)`.
+
+    Independent oracle: a brute-force scan over the raw free mask, deliberately
+    not the implementation's distance transform, so a change to the fill strategy
+    cannot hide behind a shared helper.
+    """
+    free_x, free_z = np.where(occ_map.c_space_grid == 0)
+    nearest = int(np.argmin((free_x - gx) ** 2 + (free_z - gz) ** 2))
+    return float(dist_field[free_x[nearest], free_z[nearest]])
 
 
 class TestDistanceField(unittest.TestCase):
@@ -179,6 +194,109 @@ class TestDistanceField(unittest.TestCase):
                             "cell(s) were NaN or infinite"
                         ),
                     )
+
+
+class TestCellsWithoutGraphNodes(unittest.TestCase):
+    """Regression guard for the fill of cells that carry no graph distance.
+
+    These cells used to be assigned one sentinel, `max_finite + 2.0`. Measured on
+    a 5x5 m room, that made the entire inflated margin read as farther away than
+    the most distant reachable cell, so the whole margin (~35% of the cells)
+    sorted behind genuine obstacles and the heuristic pushed the planner *against*
+    the margin it was meant to avoid.
+
+    Cells without a graph node now inherit the distance of their nearest
+    reachable free cell. `core/room.py` documents the intent; these tests pin it.
+    """
+
+    #: Cells of margin around the free space, at the shipped 0.17 m robot radius
+    #: and 0.05 m safety margin.
+    MARGIN_CELLS = math.ceil((ROBOT_RADIUS + SAFETY_MARGIN) / RESOLUTION)
+
+    def test_margin_cells_inherit_the_nearest_free_cell(self):
+        """Every wall-margin cell reads the distance of the free cell closest to it."""
+        occ_map = make_occupancy_map(Room.empty())
+        dist_field = occ_map.compute_distance_field(0.0, 0.0)
+
+        # Corners, edge midpoints, and the last row/column: all outside free space.
+        probes = [
+            (0, 0),
+            (0, self.MARGIN_CELLS),
+            (self.MARGIN_CELLS, 0),
+            (occ_map.width_cells - 1, 0),
+            (0, occ_map.depth_cells - 1),
+            (occ_map.width_cells - 1, occ_map.depth_cells - 1),
+        ]
+
+        for gx, gz in probes:
+            with self.subTest(cell=(gx, gz)):
+                self.assertNotEqual(
+                    occ_map.c_space_grid[gx, gz],
+                    0,
+                    "probe cell was expected to be outside free space",
+                )
+                expected = nearest_free_cell_distance(occ_map, dist_field, gx, gz)
+                self.assertAlmostEqual(
+                    float(dist_field[gx, gz]),
+                    expected,
+                    places=5,
+                    msg=f"cell ({gx}, {gz}) did not inherit its nearest free cell",
+                )
+
+    def test_no_cell_reads_farther_than_the_farthest_free_cell(self):
+        """The sentinel made the margin the maximum of the whole field."""
+        rooms = {
+            "empty": Room.empty(),
+            "dividing_wall": Room(width=10.0, depth=10.0, obstacles=[BoxObstacle(**DIVIDING_WALL)]),
+        }
+
+        for room_name, room in rooms.items():
+            occ_map = make_occupancy_map(room)
+            dist_field = occ_map.compute_distance_field(2.0, -2.0)
+            free = occ_map.c_space_grid == 0
+
+            with self.subTest(room=room_name):
+                self.assertTrue(free.any(), "room has no free cells to compare against")
+                self.assertAlmostEqual(
+                    float(dist_field.max()),
+                    float(dist_field[free].max()),
+                    places=5,
+                    msg="a cell with no graph node read farther than every free cell",
+                )
+
+    def test_unreachable_free_cells_inherit_the_reachable_side(self):
+        """A sealed-off pocket is filled from the nearest cell the goal can reach."""
+        # A 0.6 m wall spanning the full depth: with the 0.22 m inflation it merges
+        # into the side walls and cuts the room in two, so one half has free cells
+        # that Dijkstra cannot reach from a goal on the other side.
+        sealing_wall = BoxObstacle(x=0.0, z=0.0, width=0.6, depth=20.0)
+        room = Room(width=10.0, depth=10.0, obstacles=[sealing_wall])
+        occ_map = make_occupancy_map(room)
+
+        goal_x = 2.0
+        dist_field = occ_map.compute_distance_field(goal_x, 0.0)
+        free = occ_map.c_space_grid == 0
+
+        # Split the free space down the middle of the sealing wall; `free` is
+        # indexed [gx, gz], so the split runs along axis 0.
+        row = np.arange(occ_map.width_cells)[:, np.newaxis]
+        sealed = free & (row < occ_map.width_cells // 2)
+        reachable = free & (row >= occ_map.width_cells // 2)
+
+        self.assertTrue(sealed.any() and reachable.any(), "expected two free regions")
+
+        # Every sealed cell must carry a value that occurs on the reachable side,
+        # i.e. it inherited one rather than being given a sentinel.
+        reachable_values = {float(value) for value in dist_field[reachable]}
+        for gx, gz in zip(*np.where(sealed)):
+            with self.subTest(cell=(gx, gz)):
+                self.assertIn(float(dist_field[gx, gz]), reachable_values)
+
+        # And the sealed side must not dominate the field's range.
+        self.assertLess(
+            float(dist_field[sealed].max()),
+            float(dist_field[reachable].max()),
+        )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,11 @@ from isaacgym import gymapi, gymtorch
 import torch
 
 from core.simulator import RoombaSimulator
-from envs.planning_math import compute_planning_rewards, compute_straight_line_heuristic
+from envs.planning_math import (
+    compute_bumped,
+    compute_planning_rewards,
+    compute_straight_line_heuristic,
+)
 
 #: Two goals within this distance (m) reuse the same cached distance field. This
 #: is a numerical guard, not a task parameter, so it is not configurable.
@@ -112,31 +116,14 @@ class RoombaPlanningEnv:
         self.sim.sync_graphics()
 
     def _compute_bumped(self):
-        """Refresh contact forces and return a per-env bump boolean mask.
+        """Bump mask for the chassis, from the current contact forces.
 
-        Only the *horizontal* force components (world X and Z) are tested. The
-        chassis rests on the ground, so the vertical component (world Y) carries
-        the ground reaction and the landing impulse from the spawn-height drop;
-        it is large even when the robot is standing still in open space, which
-        made the mask fire on every macro-action regardless of collisions.
-
-        Measured on the shipped room (5x5, robot r=0.17 m), per macro-action:
-
-        * free space, `[0, 0]`/spin/straight drive: ``|f_horizontal|`` = 0.000 N
-          (567 free-space samples across 81 poses and 7 actions, peak 2e-6 N),
-          while ``|f_vertical|`` reaches 14.8 N;
-        * driving into a wall: 12.5-19.0 N.
-
-        The vertical spikes are therefore entirely responsible for the resting
-        false positives, and ``bumped_threshold`` keeps its shipped value of
-        2.0 N: roughly six orders of magnitude above the horizontal noise floor
-        and about 6x below the weakest measured real contact.
+        Delegates the force test to `envs.planning_math.compute_bumped`, which
+        reads world X and Z only; see that function for why world Y is excluded.
         """
         self.sim.gym.refresh_net_contact_force_tensor(self.sim.sim)
         forces = self.sim.contact_forces_view[:, self.sim.chassis_body_idx, :]
-        # Indices 0 and 2 are world X and Z; index 1 is world Y (up).
-        horizontal = torch.norm(forces[:, [0, 2]], dim=-1)
-        return horizontal > self.bumped_threshold
+        return compute_bumped(forces, threshold=self.bumped_threshold)
 
     def _compute_rewards(self, dist_to_goal, bumped):
         """Batched planning reward; binds task config to `envs.planning_math`.
@@ -154,19 +141,16 @@ class RoombaPlanningEnv:
         )
 
     def _get_or_update_distance_field(self, goal_x: float, goal_z: float) -> torch.Tensor:
-        """Return the geodesic distance field for a goal, recomputing on change.
+        """Geodesic distance field for a goal, recomputed only when the goal moves.
 
-        `OccupancyMap.compute_distance_field` runs Dijkstra over the precomputed
-        8-connected graph on the CPU, which is far too expensive to repeat per
-        MCTS leaf. The field depends only on the goal (the room layout is
-        static), so it is computed once per distinct goal and cached as a
-        float32 tensor on `self.device`. Caching keeps the hot search path GPU
+        `OccupancyMap.compute_distance_field` runs Dijkstra on the CPU, far too
+        expensive to repeat per MCTS leaf, and the field depends only on the goal
+        because the room layout is static. Caching keeps the hot search path GPU
         batched with no per-leaf Python work.
 
-        The field is transposed from the map's `(width_cells, depth_cells)`
-        layout to `[1, 1, depth_cells, width_cells]`, because the heuristic
-        samples it with `torch.nn.functional.grid_sample`, whose height axis must
-        be depth (Z) and width axis width (X).
+        The map returns `(width_cells, depth_cells)`; this transposes to
+        `[1, 1, depth_cells, width_cells]` because `grid_sample` maps its height
+        axis to depth (Z) and its width axis to width (X).
 
         Args:
             goal_x: Room-local goal X in metres.
@@ -196,16 +180,13 @@ class RoombaPlanningEnv:
     def compute_heuristic_values(self, states: torch.Tensor, is_terminal: torch.Tensor, gamma: float) -> torch.Tensor:
         """Leaf value estimate for MCTS; binds env config to `envs.planning_math`.
 
-        Estimates the expected discounted return of an optimal, obstacle-aware
-        trajectory to the goal, preventing stalling pathologies. The remaining
-        distance is sampled from the cached 2D geodesic distance field for the
-        current goal, so the estimate accounts for walls instead of assuming a
-        clear line of sight. This is a value estimate, not a reward, and it is
-        not potential-based reward shaping.
+        Estimates the discounted return of an obstacle-aware run to the goal,
+        which stops the search from stalling in local minima. This is a value
+        estimate, not a reward, and not reward shaping.
         """
-        # The field depends only on the goal, so one field covers the batch.
-        # Goals are shared across the planning environments (they differ only in
-        # the state being expanded), and are room-local like the field.
+        # The field depends only on the goal, and goals are shared across the
+        # planning environments (they differ only in the state being expanded),
+        # so one field covers the batch. Goals are room-local like the field.
         goal_x = states[0, 13].item()
         goal_z = states[0, 14].item()
         distance_field = self._get_or_update_distance_field(goal_x, goal_z)

@@ -24,18 +24,21 @@ existing).
 - Layers: `core/` physics/geometry · `envs/` spaces, rewards, termination, `generate` · `planners/`
   search · `scripts/` entry points · `configs/` parameters (ARCHITECTURE §1).
 - Hot paths stay GPU-batched (no per-env Python loops); the CPU occupancy map is the only exception.
-- `G(s, a)` stays Markov: teleports reset wheel DOF state; robots spawn at resting height.
+- `G(s, a)` stays Markov while `task.wheels_reset` is true (the shipped setting): teleports reset wheel
+  DOF state, and robots spawn at resting height. Turning `wheels_reset` off is an experimental choice
+  that makes the transition history-dependent — never present it as equivalent.
 - `num_actions <= num_planning_envs` (enforced in `MCTSSolver`).
 - `steps.csv` carries the planar pose (`robot_x`, `robot_z`, `robot_yaw`, immediately after `step`),
-  written by `scripts/run_mcts.py` from the logged state. `STEP_COLUMNS` has three consumers: changing it
-  means changing `tracking/run_logger.py`, `scripts/run_mcts.py`, and `tests/test_run_logger.py`
-  together. PNG frames are a derived artifact — never make one authoritative, and never let a render
-  failure change or truncate a logged record (ARCHITECTURE §6).
+  written by `scripts/run_mcts.py` from the logged state. `STEP_COLUMNS` has four consumers: changing it
+  means changing `tracking/run_logger.py`, `scripts/run_mcts.py`, `scripts/debug_mcts.py`, and
+  `tests/test_run_logger.py` together. PNG frames are a derived artifact — never make one authoritative,
+  and never let a render failure change or truncate a logged record (ARCHITECTURE §6).
 
 ## Config
 
-- Owners: `configs/config.yaml` (env/simulation/room/task/sensors/robot), `configs/planners.yaml`,
-  `configs/experiments.yaml`. No hard-coded tunables where an owner exists; no duplicated or dead keys.
+- Owners: `configs/config.yaml` (env/simulation/planning/rl/room/task/sensors/robot),
+  `configs/planners.yaml`, and `configs/experiments.yaml` (`mcts.*` and `debug_mcts.*`). No hard-coded
+  tunables where an owner exists; no duplicated or dead keys.
 - Required keys are direct-indexed (fail fast): `room.occupancy_map.*`,
   `room.start_goal_sampling.min_distance`, `task.{goal_radius,goal_reward,collision_penalty,step_cost}`,
   `simulation.{num_position_iterations,num_velocity_iterations}`. No silent fallbacks; no task
@@ -45,13 +48,29 @@ existing).
 
 - Prefer GPU-free checks; do not launch GPU experiments unless required, and never to validate docs
   (if one is needed, `scripts/run_mcts.py` with the viewer off, stopped early). `tests/` is tracked and
-  CPU-only: `python -m unittest discover -s tests` is the pre-experiment gate, currently 96 tests
-  (`test_distance_field` 4, `test_mcts` 26, `test_planning_math` 31, `test_run_logger` 24,
-  `test_spatial_plotter` 11), and no test may need Isaac Gym, CUDA, or a GPU. Run it before claiming a
-  suite result; the CPU-only modules `tests/test_spatial_plotter.py` (visualizer + offline replay) and
-  `tests/test_run_logger.py` (log schema) are the ones that guard the logging path. A test that needs a
-  GPU does not belong here.
+  CPU-only: `python -m unittest discover -s tests` is the pre-experiment gate, currently 145 tests
+  (`test_distance_field` 7, `test_envs` 27, `test_mcts` 26, `test_planning_math` 50,
+  `test_run_logger` 24, `test_spatial_plotter` 11), and no test may need Isaac Gym, CUDA, or a GPU.
+  Run it before claiming a suite result; the CPU-only modules `tests/test_spatial_plotter.py`
+  (visualizer + offline replay) and `tests/test_run_logger.py` (log schema) are the ones that guard the
+  logging path. `tests/test_distance_field.py` and `tests/test_envs.py` register import stubs when
+  `isaacgym` is absent and build environment instances without a simulator, so they run on a machine
+  with no GPU install. A test that needs a GPU does not belong here.
 - Prefer existing dependencies; never invent versions or install paths — Isaac Gym, CUDA, and PyTorch
   are unpinned external prerequisites.
 - Concise, implemented-vs-planned, relative links, no invented numbers. Architecture detail in
   `docs/ARCHITECTURE.md`, planning in `ROADMAP.md`, no duplication.
+
+## Reference docs
+
+`docs/SimulationSetup.md` and `docs/TensorAPI.md` are **verbatim copies of the Isaac Gym documentation**
+(scraped from the `docs.robotsfan.com` mirror, pandoc artifacts and all). They document the generic Isaac
+Gym API — simulation setup, assets, actors, viewer, tensors — and say nothing about this repository.
+
+- Consult them for `gymapi` / tensor-API questions instead of guessing at the API.
+- Never edit them, and never treat them as project truth or as evidence for this codebase's behavior:
+  the code wins, repo-specific facts belong in `docs/ARCHITECTURE.md`.
+- Their relative links (`../_images/...`) do not resolve here.
+
+The other files in `docs/`: `ARCHITECTURE.md` (technical truth, §1 for the layer table), and
+`COMPLETED_TASKS.md` (a history of finished work — not current behavior, do not cite it as truth).

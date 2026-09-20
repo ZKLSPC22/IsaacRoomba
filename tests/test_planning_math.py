@@ -1,19 +1,12 @@
 """Tests for `envs.planning_math`.
 
-These tests pin the *existing* reward and heuristic formulas, plus the *planned*
-geodesic sampling contract for the leaf heuristic. They import `torch` (and
-`numpy` for an independent sampling reference), so they run on CPU without Isaac
-Gym.
+Pins the reward, bumper, and leaf-heuristic formulas, plus the geodesic sampling
+contract the planner actually runs with. Imports `torch` (and `numpy` for an
+independent sampling reference), so it runs on CPU without Isaac Gym.
 
-`GeodesicHeuristicTests` exercises the signature that `compute_straight_line_heuristic`
-will gain (`distance_field`, `room_width`, `room_depth`). Until that parameter set
-is implemented it fails with `TypeError`; that failure is the intended state of
-ROADMAP Task 2.1 and not a broken test.
-
-The heuristic under test is a **value estimate** used as an MCTS leaf value. It is
-not part of the environment reward and it is **not** potential-based reward
-shaping; PBRS would require an added reward term of the form
-`gamma * Phi(next_state) - Phi(state)`, which this codebase does not implement.
+`ConfigContractTests` ties every value repeated below back to the real
+`configs/config.yaml`, so the constants here cannot silently drift from the
+running system.
 """
 
 import math
@@ -28,6 +21,7 @@ import torch
 import yaml
 
 from envs.planning_math import (
+    compute_bumped,
     compute_planning_rewards,
     compute_straight_line_heuristic,
     VALID_SAMPLING_MODES,
@@ -54,6 +48,10 @@ GAMMA = 0.95
 # `ConfigContractTests` asserts it matches, so the tests cannot silently exercise a
 # different interpolation than the one the planner runs with.
 HEURISTIC_SAMPLING = "bilinear"
+
+# Bumper sensitivity in newtons, from `configs/config.yaml` under
+# `task.bumped_threshold`. `ConfigContractTests` asserts it matches.
+BUMPED_THRESHOLD = 2.0
 
 
 def make_states(start_x, start_z, goal_x, goal_z):
@@ -100,19 +98,20 @@ def expected_value(H, gamma=GAMMA):
 
 
 # --- Geodesic distance-field fixtures ---------------------------------------
-# These pin the *planned* sampling contract: `compute_straight_line_heuristic`
-# gains `distance_field`, `room_width`, and `room_depth` and samples the field
-# instead of measuring a straight-line distance.
+# `compute_straight_line_heuristic` samples this field instead of measuring a
+# straight-line distance when `distance_field`, `room_width` and `room_depth` are
+# all supplied.
 
 #: 50 x 50 cells over a 5.0 m x 5.0 m room, i.e. 0.1 m cells.
 GEODESIC_ROOM_SIZE = 5.0
 GEODESIC_CELLS = 50
 GEODESIC_RESOLUTION = GEODESIC_ROOM_SIZE / GEODESIC_CELLS
 
-#: Grid rows/cols overwritten with a large finite value, standing in for an
+#: Grid rows/cols overwritten with a large finite value, standing in for the
 #: inflated obstacle margin: `[gz, gx]` indices covering roughly x in
-#: [-1.5, -0.5] m and z in [0.5, 1.5] m. A real field uses `max_finite + 2.0`
-#: there, never `inf`.
+#: [-1.5, -0.5] m and z in [0.5, 1.5] m. Real fields stay finite everywhere
+#: (`core/room.py` inherits the nearest reachable cell), so a large finite value
+#: is the realistic stand-in.
 GEODESIC_OBSTACLE_ROWS = slice(30, 40)
 GEODESIC_OBSTACLE_COLS = slice(10, 20)
 
@@ -171,6 +170,19 @@ def expected_geodesic_value(sampled_distance: float, gamma=GAMMA) -> float:
     return expected_value(H, gamma)
 
 
+def nearest_cell_value(field: np.ndarray, x: float, z: float) -> float:
+    """Independent NumPy reference for `grid_sample(mode="nearest")`.
+
+    Reads the field value at the containing cell centre, with no interpolation.
+    """
+    height, width = field.shape  # (depth, width)
+    fx = ((x / (GEODESIC_ROOM_SIZE / 2.0)) + 1.0) * 0.5 * (width - 1)
+    fz = ((z / (GEODESIC_ROOM_SIZE / 2.0)) + 1.0) * 0.5 * (height - 1)
+    fx = min(max(fx, 0.0), width - 1)
+    fz = min(max(fz, 0.0), height - 1)
+    return float(field[round(fz), round(fx)])
+
+
 class ConfigContractTests(unittest.TestCase):
     """The task constants are owned by `configs/config.yaml`.
 
@@ -206,6 +218,23 @@ class ConfigContractTests(unittest.TestCase):
 
         self.assertEqual(task["heuristic_sampling"], HEURISTIC_SAMPLING)
         self.assertIn(HEURISTIC_SAMPLING, VALID_SAMPLING_MODES)
+
+    def test_bumped_threshold_matches_config(self):
+        """Both environments read this one key, so it must be the pinned value."""
+        task = yaml.safe_load(CONFIG_PATH.read_text())["task"]
+        self.assertEqual(task["bumped_threshold"], BUMPED_THRESHOLD)
+
+    def test_wheels_reset_is_configured(self):
+        """`task.wheels_reset` gates the Markov wheel-DOF reset in `set_states`."""
+        task = yaml.safe_load(CONFIG_PATH.read_text())["task"]
+        self.assertIsInstance(task["wheels_reset"], bool)
+
+    def test_solver_iterations_are_configured(self):
+        """Required PhysX keys, direct-indexed by `RoombaSimulator`."""
+        simulation = yaml.safe_load(CONFIG_PATH.read_text())["simulation"]
+
+        self.assertGreaterEqual(simulation["num_position_iterations"], 1)
+        self.assertGreaterEqual(simulation["num_velocity_iterations"], 1)
 
     def test_task_constants_are_not_defined_in_planning_math(self):
         """Guard against reintroducing a second copy of the constants."""
@@ -248,6 +277,119 @@ class RequiredSignatureTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             heuristic(states, torch.tensor([False]), sampling_mode="bicubic")
+
+
+class BumperTests(unittest.TestCase):
+    """The bumper reads the horizontal contact force only.
+
+    Regression guard: the mask used the full force norm, so world Y -- which
+    carries the ground reaction and reaches 14.8 N while the robot stands still --
+    made it fire on every macro-action regardless of collisions.
+    """
+
+    def bump(self, forces, threshold=BUMPED_THRESHOLD):
+        return compute_bumped(torch.tensor(forces, dtype=torch.float32), threshold=threshold)
+
+    def test_vertical_force_alone_is_not_a_bump(self):
+        """The resting ground reaction must not register as a collision."""
+        self.assertFalse(self.bump([[0.0, 14.8, 0.0]])[0].item())
+
+    def test_world_x_force_is_a_bump(self):
+        self.assertTrue(self.bump([[15.0, 0.0, 0.0]])[0].item())
+
+    def test_world_z_force_is_a_bump(self):
+        self.assertTrue(self.bump([[0.0, 0.0, 15.0]])[0].item())
+
+    def test_threshold_is_exclusive(self):
+        """`> threshold`, matching the reward's exclusive `< goal_radius` test."""
+        at_threshold = self.bump([[BUMPED_THRESHOLD, 0.0, 0.0]])
+        just_above = self.bump([[BUMPED_THRESHOLD + 1e-3, 0.0, 0.0]])
+
+        self.assertFalse(at_threshold[0].item())
+        self.assertTrue(just_above[0].item())
+
+    def test_both_horizontal_axes_contribute_to_one_norm(self):
+        """X and Z combine as a magnitude, not a per-axis maximum."""
+        # 1.6 N on each axis is 2.26 N combined: a bump, though neither axis
+        # alone clears the 2.0 N threshold.
+        self.assertTrue(self.bump([[1.6, 0.0, 1.6]])[0].item())
+
+    def test_free_space_noise_floor_is_not_a_bump(self):
+        """The measured horizontal peak in free space is 2e-6 N."""
+        self.assertFalse(self.bump([[2e-6, 0.0, -2e-6]])[0].item())
+
+    def test_batch_shape_and_dtype(self):
+        mask = self.bump([[0.0, 20.0, 0.0], [20.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+
+        self.assertEqual(mask.shape, (3,))
+        self.assertEqual(mask.dtype, torch.bool)
+
+    def test_threshold_is_required(self):
+        """No hidden default: the owner is `task.bumped_threshold`."""
+        with self.assertRaises(TypeError):
+            compute_bumped(torch.zeros((1, 3)))
+
+
+class GeodesicArgumentTests(unittest.TestCase):
+    """The two distance sources are mutually exclusive and behave differently."""
+
+    def setUp(self):
+        self.field = geodesic_field_tensor()
+        self.not_terminal = torch.tensor([False])
+
+    def test_partial_geodesic_arguments_raise(self):
+        """A partial set would silently change which distance is optimized."""
+        states = make_states([0.0], [0.0], [1.0], [0.0])
+        partial_sets = {
+            "field only": {"distance_field": self.field},
+            "width only": {"room_width": GEODESIC_ROOM_SIZE},
+            "depth only": {"room_depth": GEODESIC_ROOM_SIZE},
+            "field and width": {
+                "distance_field": self.field,
+                "room_width": GEODESIC_ROOM_SIZE,
+            },
+            "field and depth": {
+                "distance_field": self.field,
+                "room_depth": GEODESIC_ROOM_SIZE,
+            },
+            "width and depth": {
+                "room_width": GEODESIC_ROOM_SIZE,
+                "room_depth": GEODESIC_ROOM_SIZE,
+            },
+        }
+
+        for name, kwargs in partial_sets.items():
+            with self.subTest(partial=name), self.assertRaises(ValueError):
+                heuristic(states, self.not_terminal, **kwargs)
+
+    def test_omitting_all_three_uses_the_straight_line_distance(self):
+        """The state's own goal columns are then the only distance source."""
+        max_dist_per_step = MAX_LINEAR_VELOCITY * MACRO_ACTION_DURATION
+        states = make_states([0.0], [0.0], [GOAL_RADIUS + (3.0 * max_dist_per_step)], [0.0])
+
+        values = heuristic(states, self.not_terminal)
+
+        self.assertAlmostEqual(values[0].item(), expected_value(3.0), places=5)
+
+    def test_straight_line_mode_ignores_the_goal_columns_only_used_by_it(self):
+        """Geodesic mode takes its distance from the field, not the state."""
+        # Same pose, a goal at 2 m and a goal at 4 m: straight-line mode must
+        # differ, geodesic mode must not (the field was built for one goal).
+        near_goal = make_states([0.0], [0.0], [GOAL_RADIUS + 2.0], [0.0])
+        far_goal = make_states([0.0], [0.0], [GOAL_RADIUS + 4.0], [0.0])
+        geodesic_kwargs = {
+            "distance_field": self.field,
+            "room_width": GEODESIC_ROOM_SIZE,
+            "room_depth": GEODESIC_ROOM_SIZE,
+        }
+
+        straight_near = heuristic(near_goal, self.not_terminal)[0].item()
+        straight_far = heuristic(far_goal, self.not_terminal)[0].item()
+        geodesic_near = heuristic(near_goal, self.not_terminal, **geodesic_kwargs)[0].item()
+        geodesic_far = heuristic(far_goal, self.not_terminal, **geodesic_kwargs)[0].item()
+
+        self.assertNotAlmostEqual(straight_near, straight_far, places=3)
+        self.assertAlmostEqual(geodesic_near, geodesic_far, places=6)
 
 
 class RewardTests(unittest.TestCase):
@@ -525,6 +667,48 @@ class GeodesicHeuristicTests(unittest.TestCase):
         outside = make_states([10.0], [10.0], [GOAL_RADIUS], [0.0])
         outside_values = self.call_heuristic(outside, torch.tensor([False]))
         self.assertTrue(torch.isfinite(outside_values[0]).item())
+
+    def test_sampling_uses_the_field_not_the_state_distance(self):
+        """The two distance sources disagree here, so they cannot be confused."""
+        # The field reads 3.05 m at (0.0, 0.0); the straight line to the goal in
+        # the state is ~1.25 m.
+        states = make_states([0.0], [0.0], [GOAL_RADIUS + 1.25], [0.0])
+        not_terminal = torch.tensor([False])
+
+        geodesic = self.call_heuristic(states, not_terminal)[0].item()
+        straight = heuristic(states, not_terminal)[0].item()
+
+        sampled = sample_geodesic_field(self.field, 0.0, 0.0)
+        self.assertAlmostEqual(geodesic, expected_geodesic_value(sampled), places=4)
+        self.assertNotAlmostEqual(geodesic, straight, places=3)
+
+    def test_nearest_mode_quantizes_to_the_containing_cell(self):
+        """`nearest` reproduces the pre-toggle sampling instead of blending."""
+        # (0.09, 0.05) sits inside the cell centred at (0.05, 0.05), well away
+        # from that centre, so bilinear and nearest must disagree.
+        states = make_states([0.09], [0.05], [GOAL_RADIUS], [0.0])
+        not_terminal = torch.tensor([False])
+
+        nearest = self.call_heuristic(states, not_terminal, sampling_mode="nearest")[0].item()
+        bilinear = self.call_heuristic(states, not_terminal, sampling_mode="bilinear")[0].item()
+
+        self.assertAlmostEqual(
+            nearest,
+            expected_geodesic_value(nearest_cell_value(self.field, 0.09, 0.05)),
+            places=4,
+        )
+        # Bilinear blends the neighbouring cells; the fixture field rises with
+        # +x, so the blend lands on a larger distance, i.e. a lower value.
+        self.assertLess(bilinear, nearest)
+
+    def test_out_of_room_poses_clamp_under_both_modes(self):
+        """`padding_mode="border"` must not depend on the interpolation mode."""
+        outside = make_states([10.0], [10.0], [GOAL_RADIUS], [0.0])
+
+        for mode in VALID_SAMPLING_MODES:
+            with self.subTest(mode=mode):
+                values = self.call_heuristic(outside, torch.tensor([False]), sampling_mode=mode)
+                self.assertTrue(torch.isfinite(values[0]).item())
 
 
 if __name__ == "__main__":

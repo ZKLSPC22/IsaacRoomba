@@ -5,14 +5,13 @@ without a GPU by constructing `MCTSSolver` against a minimal stub environment.
 
 The stub exposes only `.num_envs` and `.device`. That is deliberate: per
 `AGENTS.md`, planners may reach the environment only through `generate(...)`,
-`compute_heuristic_values(...)`, and the spaces/attributes the environment
-exposes. If `MCTSSolver` ever starts touching `env.sim` or other simulator
-internals, these tests fail loudly rather than silently crossing the layer
-boundary.
+`compute_heuristic_values(...)`, and the exposed spaces/attributes. If `MCTSSolver`
+ever starts touching `env.sim` or other simulator internals, these tests fail
+loudly rather than silently crossing the layer boundary.
 
-Scope: Tier 1 only — the shipped action set, action-grid construction, and
-configuration validation. Batched expansion and padding behavior need a recording
-generative stub and are planned as Tier 2.
+Scope: the shipped action set, action-grid construction, and configuration
+validation. Batched expansion and action padding (`MCTSSolver._expand`) need a
+recording generative stub and are still untested.
 """
 
 import sys
@@ -39,24 +38,16 @@ MCTS_ACTIONS_KEY = "actions"
 LEGACY_ACTION_KEYS = ("v_vals", "omega_vals")
 
 # ---------------------------------------------------------------------------
-# Assumptions pending confirmation
+# `CCW_SIGN` / `CW_SIGN` name which normalized angular value is physically
+# counterclockwise. The wheel conversion in `envs/planning_env.py` negates both
+# wheel targets, so the mapping cannot be read off the source. Confirm it
+# empirically (`scripts/debug_rl.py` with `0 1.0 30` vs `0 -1.0 30`) before
+# relying on these names;
+# `ActionSetContractTests.test_shipped_action_structure` is sign-independent.
 #
-# The two items below encode design choices that were raised for confirmation and
-# have not been answered yet. They are isolated here so that flipping either one is
-# a one-line change rather than a rewrite.
-#
-# 1. `CCW_SIGN` / `CW_SIGN`: which normalized angular value is physically
-#    counterclockwise. The wheel conversion in `envs/planning_env.py` negates both
-#    wheel targets, so the mapping cannot be read off the source. Verify
-#    empirically with `scripts/debug_rl.py` (`0 1.0 30` vs `0 -1.0 30`) before
-#    trusting these values. The structural test
-#    `ActionSetContractTests.test_shipped_action_structure` is sign-independent and
-#    will remain meaningful either way.
-#
-# 2. Action order. An action's index is its identity: it is stored in
-#    `node.action_taken`, written to the run log, and used as the tie-break key in
-#    `BaseSearcher.search()` (which keeps the first maximum encountered, so lower
-#    indices win exact ties). Forward actions are listed first deliberately.
+# Action order matters: the index is the action's identity in `node.action_taken`,
+# in the run log, and in the `BaseSearcher.search()` tie-break (which keeps the
+# first maximum, so lower indices win). Forward actions are listed first on purpose.
 # ---------------------------------------------------------------------------
 CCW_SIGN = 1.0
 CW_SIGN = -1.0

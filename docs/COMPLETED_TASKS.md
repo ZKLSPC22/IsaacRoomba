@@ -928,3 +928,32 @@ Requirements:
 
 
 - [X] Dijkstra Heuristic should use bilinear mode and not use arbitrary high distance to push agent away from obstacles as this causes undesirable reward shaping, a functional bumper would drive the planner away from obstacles.
+
+
+- [X] Suspect asymmetry between clockwise rotation and anti-clockwise rotation, see /logs/debug_mcts/mcts_20260915_131226/steps.csv
+
+  - [x] Root cause diagnosed: caster friction was never disabled. Casters now load frictionless
+    (`core/simulator.py`, `docs/ARCHITECTURE.md` §2); residual asymmetry is unexplained.
+
+  - [X] Problem remains, now suspect insufficient velocity and position PhysX iteration, increase num_position_iterations 4 -> 16, num_velocity_iterations 1 -> 8. Add config['simulation'], add num_position_iterations and num_velocity_iterations to config['simulation'], inheritted by simulator.py.
+
+
+- [x] Tests should be changed to fit the new version, and ensure the new bumper physics and Hijkstra Heuristic.
+
+  - [x] Bumper math extracted to `envs/planning_math.compute_bumped` and shared by both environments;
+    both now read `task.bumped_threshold` (`RoombaRLEnv` previously hard-coded 0.1 N).
+  - [x] New `tests/test_envs.py` (config binding, distance-field cache, `wheels_reset`); distance-field
+    and planning-math gaps closed. Gate is now 145 tests.
+
+
+- [x] Two newly added .md files (SimulationSetup.md, TensorAPI.md) are Isaac Gym official documents, these should be addressed in other agent guide .md files.
+
+  - [x] Now labelled as vendored third-party API reference in `AGENTS.md` ("Reference docs"),
+    `.github/copilot-instructions.md`, `README.md` ("Docs"), and `docs/ARCHITECTURE.md` (header), with
+    the rule that they are never edited and never authoritative about this repository.
+
+
+- [X] .md files are outdated, identify problematic lines, do not update yet.
+
+
+- [X] Update outdated .md files.

@@ -16,32 +16,13 @@ Clean-up and debug MCTS, run experiments to verify robustness of code, debug, th
 
 ### Open Tasks:
 
-- [ ] Suspect asymmetry between clockwise rotation and anti-clockwise rotation, see /logs/debug_mcts/mcts_20260915_131226/steps.csv
-
-  - [x] Root cause diagnosed: caster friction was never disabled. Casters now load frictionless
-    (`core/simulator.py`, `docs/ARCHITECTURE.md` §2); residual asymmetry is unexplained.
-
-  - [X] Problem remains, now suspect insufficient velocity and position PhysX iteration, increase num_position_iterations 4 -> 16, num_velocity_iterations 1 -> 8. Add config['simulation'], add num_position_iterations and num_velocity_iterations to config['simulation'], inheritted by simulator.py.
-
-- [ ] Tests should be changed to fit the new version, and ensure the new bumper physics and Hijkstra Heuristic.
-
-
-- [ ] Two newly added .md files (SimulationSetup.md, TensorAPI.md) are Isaac Gym official documents, these should be addressed in other agent guide .md files.
-
-
-- [ ] .md files are outdated, identify problematic lines.
-
-
-- [ ] Update outdated .md files.
-
-
 - [ ] Log Tests results and correspond with git version. What should be the work flow? Commit more often?
 
 
 - [ ] Run experiments using different room-sizes, obstacle configurations, seeds, and search depths.
 
 
-`tests/` is tracked and CPU-only; `python -m unittest discover -s tests` passes 76 tests with no GPU, so it can serve as the pre-experiment gate. `AGENTS.md` still carries the older "untracked and red" assumption.
+`tests/` is tracked and CPU-only; `python -m unittest discover -s tests` passes 145 tests with no GPU, so it can serve as the pre-experiment gate. `AGENTS.md` carries the same count.
 
 
 ## Milestones [Future]
